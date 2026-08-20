@@ -94,13 +94,25 @@ class TestLoadScaling:
         stress_t = rng.standard_normal((n_nodes, 3, 3)) * 1e6
         vm = np.abs(rng.standard_normal(n_nodes)) * 1e6
 
+        n_elems = 80
+        stress_t_elem = rng.standard_normal((n_elems, 3, 3)) * 1e6
+        stress_v_elem = rng.standard_normal((n_elems, 6)) * 1e6
+        strain_v_elem = rng.standard_normal((n_elems, 6)) * 1e-4
+        vm_elem = np.abs(rng.standard_normal(n_elems)) * 1e6
+
         return FEMResult(
             displacement=disp,
-            stress_tensor=stress_t,
-            stress_voigt=stress_v,
-            strain_voigt=strain_v,
-            von_mises=vm,
+            stress_tensor_elem=stress_t_elem,
+            stress_voigt_elem=stress_v_elem,
+            strain_voigt_elem=strain_v_elem,
+            von_mises_elem=vm_elem,
+            stress_voigt_nodal=stress_v,
+            strain_voigt_nodal=strain_v,
+            von_mises_nodal=vm,
+            reaction_forces=np.zeros((n_nodes, 3)),
+            rhs_nodal_forces=np.zeros((n_nodes, 3)),
             solve_time_s=1.0,
+            n_elements=n_elems,
         )
 
     def test_scale_factors_decrease_with_sf(self) -> None:
