@@ -1,0 +1,10 @@
+{
+  "tasks": [
+    {"id": 1, "title": "L-Bracket fillet radius parameterization", "status": "done", "note": "Baked into initial l_bracket.py build"},
+    {"id": 2, "title": "Mode-aware geometric-linearity gate", "status": "done", "note": "Baked into initial load_scaling.py build"},
+    {"id": 3, "title": "Base-sample-aware leakage-safe splitting", "status": "done", "note": "Baked into initial split_strategy.py build"},
+    {"id": 4, "title": "Peterson-chart Kt calibration suite", "status": "pending", "note": "Requires Colab FEM solves"},
+    {"id": 5, "title": "Linearity spot-check", "status": "pending", "note": "Requires Colab FEM solves"},
+    {"id": 6, "title": "README/ADR provenance corrections", "status": "pending", "note": "Documentation task"}
+  ]
+}
