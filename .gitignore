@@ -3,8 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Output datasets and large mesh files
-output/
+# Output datasets and large mesh files generated during runs (root output folder only)
+/output/
 *.h5
 *.hdf5
 *.msh
