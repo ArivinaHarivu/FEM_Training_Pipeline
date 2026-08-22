@@ -166,9 +166,15 @@ class BlockWithHoles(GeometryFamily):
             surfaces = gmsh.model.getEntities(dim=2)
             surface_tags = self._tag_surfaces(dims, surfaces)
 
-            # Set mesh size
+            # Adaptive Mesh Settings:
+            # Scale minimum element size to min_hole_radius / 3 to resolve hoop stress
+            radii = [h["radius_norm"] * float(np.min(dims[:2])) for h in holes] if holes else []
+            min_radius = min(radii) if radii else mesh_size
+            local_mesh_size = min(mesh_size, max(min_radius / 3.0, mesh_size * 0.02))
+
             gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
-            gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size * 0.3)
+            gmsh.option.setNumber("Mesh.CharacteristicLengthMin", local_mesh_size * 0.5)
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 16)  # 16 elements per circle
 
             # Generate 3D tetrahedral mesh
             gmsh.model.mesh.generate(3)

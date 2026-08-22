@@ -118,26 +118,28 @@ class BlockWithFillet(GeometryFamily):
                 max_radius = 0.45 * float(np.min(dims))
                 actual_radius = min(fillet_radius, max_radius)
 
-                if actual_radius > mesh_size * 0.3:
-                    try:
-                        occ.fillet(
-                            [(3, block)],
-                            selected_edges,
-                            [actual_radius],
-                        )
-                    except Exception:
-                        # If fillet fails on some edges, try one at a time
-                        for edge_tag in selected_edges:
-                            try:
-                                volumes = gmsh.model.getEntities(dim=3)
-                                if volumes:
-                                    occ.fillet(
-                                        [volumes[0]],
-                                        [edge_tag],
-                                        [actual_radius],
-                                    )
-                            except Exception:
-                                continue  # skip unfillettable edges
+                # Local target element size tied directly to fillet radius:
+                local_mesh_size = min(mesh_size, max(actual_radius / 3.0, mesh_size * 0.02))
+
+                try:
+                    occ.fillet(
+                        [(3, block)],
+                        selected_edges,
+                        [actual_radius],
+                    )
+                except Exception:
+                    # If fillet fails on some edges, try one at a time
+                    for edge_tag in selected_edges:
+                        try:
+                            volumes = gmsh.model.getEntities(dim=3)
+                            if volumes:
+                                occ.fillet(
+                                    [volumes[0]],
+                                    [edge_tag],
+                                    [actual_radius],
+                                )
+                        except Exception:
+                            continue  # skip unfillettable edges
 
             occ.synchronize()
 
@@ -145,9 +147,30 @@ class BlockWithFillet(GeometryFamily):
             surfaces = gmsh.model.getEntities(dim=2)
             surface_tags = self._tag_surfaces(dims, surfaces)
 
-            # Mesh
+            # Adaptive Mesh Field Settings:
             gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
-            gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size * 0.2)
+            gmsh.option.setNumber("Mesh.CharacteristicLengthMin", local_mesh_size * 0.5)
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12)
+
+            if selected_edges:
+                try:
+                    dist_field = gmsh.model.mesh.field.add("Distance")
+                    gmsh.model.mesh.field.setNumbers(
+                        dist_field, "CurvesList", [float(t) for t in selected_edges],
+                    )
+                    gmsh.model.mesh.field.setNumber(dist_field, "Sampling", 100)
+
+                    thresh_field = gmsh.model.mesh.field.add("Threshold")
+                    gmsh.model.mesh.field.setNumber(thresh_field, "InField", dist_field)
+                    gmsh.model.mesh.field.setNumber(thresh_field, "SizeMin", local_mesh_size)
+                    gmsh.model.mesh.field.setNumber(thresh_field, "SizeMax", mesh_size)
+                    gmsh.model.mesh.field.setNumber(thresh_field, "DistMin", actual_radius * 1.5)
+                    gmsh.model.mesh.field.setNumber(thresh_field, "DistMax", actual_radius * 5.0)
+
+                    gmsh.model.mesh.field.setAsBackgroundMesh(thresh_field)
+                except Exception:
+                    pass
+
             gmsh.model.mesh.generate(3)
             gmsh.model.mesh.setOrder(2)  # tet4 → tet10 (quadratic)
 

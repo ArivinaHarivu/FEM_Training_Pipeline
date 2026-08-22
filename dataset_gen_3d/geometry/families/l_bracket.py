@@ -123,11 +123,11 @@ class LBracket(GeometryFamily):
         max_fillet = min(notch_depth, notch_width, section_depth) * 0.9
         if fillet_radius > max_fillet:
             fillet_radius = max_fillet
-        if fillet_radius < mesh_size * 0.5:
-            raise GeometryGenerationError(
-                f"Fillet radius {fillet_radius:.4f}m < 0.5×mesh_size "
-                f"{mesh_size:.4f}m — geometry would be poorly resolved"
-            )
+
+        # Local target element size tied directly to fillet radius:
+        # local_size = fillet_radius / 3 guarantees >= 3-4 quadratic elements
+        # across the fillet arc to accurately capture sharp stress gradients.
+        local_mesh_size = min(mesh_size, max(fillet_radius / 3.0, mesh_size * 0.02))
 
         gmsh.initialize()
         gmsh.option.setNumber("General.Verbosity", 0)
@@ -162,7 +162,7 @@ class LBracket(GeometryFamily):
             edges = gmsh.model.getEntities(dim=1)
             fillet_edges = self._find_notch_root_edges(
                 edges, notch_x, notch_y, depth,
-                tol=mesh_size * 0.1,
+                tol=max(mesh_size * 0.1, fillet_radius * 0.5),
             )
 
             if fillet_edges:
@@ -185,9 +185,32 @@ class LBracket(GeometryFamily):
                 width, height, depth, notch_x, notch_y, surfaces,
             )
 
-            # Mesh settings — refine near fillet
+            # Adaptive Mesh Field Settings:
+            # 1. Distance field from the notch root fillet curves
+            # 2. Threshold field smoothly transitioning from local_mesh_size at the fillet
+            #    to standard mesh_size in the far field
             gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
-            gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size * 0.2)
+            gmsh.option.setNumber("Mesh.CharacteristicLengthMin", local_mesh_size * 0.5)
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12)  # 12 elements per 2pi
+
+            if fillet_edges:
+                try:
+                    dist_field = gmsh.model.mesh.field.add("Distance")
+                    gmsh.model.mesh.field.setNumbers(
+                        dist_field, "CurvesList", [float(tag) for _, tag in fillet_edges],
+                    )
+                    gmsh.model.mesh.field.setNumber(dist_field, "Sampling", 100)
+
+                    thresh_field = gmsh.model.mesh.field.add("Threshold")
+                    gmsh.model.mesh.field.setNumber(thresh_field, "InField", dist_field)
+                    gmsh.model.mesh.field.setNumber(thresh_field, "SizeMin", local_mesh_size)
+                    gmsh.model.mesh.field.setNumber(thresh_field, "SizeMax", mesh_size)
+                    gmsh.model.mesh.field.setNumber(thresh_field, "DistMin", fillet_radius * 1.5)
+                    gmsh.model.mesh.field.setNumber(thresh_field, "DistMax", fillet_radius * 5.0)
+
+                    gmsh.model.mesh.field.setAsBackgroundMesh(thresh_field)
+                except Exception:
+                    pass  # fallback to curvature-based and min/max characteristic lengths
 
             # Generate 3D tet mesh
             gmsh.model.mesh.generate(3)
@@ -212,6 +235,7 @@ class LBracket(GeometryFamily):
                 **params,
                 "fillet_radius": fillet_radius,
                 "section_depth": section_depth,
+                "local_mesh_size": local_mesh_size,
             }
 
             return GeometryResult(
