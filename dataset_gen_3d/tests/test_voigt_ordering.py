@@ -76,7 +76,8 @@ def _test_voigt_fenicsx() -> None:
     u_sol = problem.solve()
 
     W_dg0 = fem.functionspace(msh, ("DG", 0, (3, 3)))
-    stress_expr = fem.Expression(sigma(u_sol), W_dg0.element.interpolation_points())
+    interp_pts = _get_interpolation_points(W_dg0.element)
+    stress_expr = fem.Expression(sigma(u_sol), interp_pts)
     stress_dg0 = fem.Function(W_dg0)
     stress_dg0.interpolate(stress_expr)
 
@@ -144,3 +145,13 @@ def _test_voigt_legacy_dolfin() -> None:
     assert abs(mean_stress[0]) > 0.5 * traction_mag
     assert np.argmax(np.abs(mean_stress)) == 0
     print(f"✓ Legacy FEniCS Voigt ordering validated! Mean Voigt: {mean_stress}")
+
+
+def _get_interpolation_points(element: Any) -> np.ndarray:
+    pts = getattr(element, "interpolation_points", None)
+    if pts is None:
+        pts = element.interpolation_points()
+    elif callable(pts):
+        pts = pts()
+    return pts
+

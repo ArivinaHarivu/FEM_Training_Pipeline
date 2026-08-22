@@ -78,7 +78,7 @@ def assign_splits(
 
     # Step 1: Large-scale bucket → test holdout
     large_mask = base_df["scale_bucket"] == "large"
-    large_ids = base_df.loc[large_mask, "base_sample_id"].values
+    large_ids = np.array(base_df.loc[large_mask, "base_sample_id"].tolist(), dtype=object)
     if len(large_ids) > 0:
         n_holdout = max(1, int(len(large_ids) * large_holdout_frac))
         rng.shuffle(large_ids)
@@ -100,7 +100,7 @@ def assign_splits(
 
     # Step 3: Assign remaining by stratified random split
     unassigned = base_df["split"] == ""
-    remaining_ids = base_df.loc[unassigned, "base_sample_id"].values.copy()
+    remaining_ids = np.array(base_df.loc[unassigned, "base_sample_id"].tolist(), dtype=object)
     rng.shuffle(remaining_ids)
 
     # Group by stratum for stratified split

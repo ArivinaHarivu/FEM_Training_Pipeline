@@ -178,13 +178,14 @@ def _run_solve_fenicsx(
 
     # ── Extract DG0 Stress & Strain (Element-wise) ──
     W_dg0 = fem.functionspace(msh, ("DG", 0, (3, 3)))
+    interp_pts = _get_interpolation_points(W_dg0.element)
 
-    stress_expr = fem.Expression(sigma(u_sol), W_dg0.element.interpolation_points())
+    stress_expr = fem.Expression(sigma(u_sol), interp_pts)
     stress_dg0 = fem.Function(W_dg0)
     stress_dg0.interpolate(stress_expr)
     stress_tensor_elem = stress_dg0.x.array.reshape(n_cells, 3, 3).copy()
 
-    strain_expr = fem.Expression(epsilon(u_sol), W_dg0.element.interpolation_points())
+    strain_expr = fem.Expression(epsilon(u_sol), interp_pts)
     strain_dg0 = fem.Function(W_dg0)
     strain_dg0.interpolate(strain_expr)
     strain_tensor_elem = strain_dg0.x.array.reshape(n_cells, 3, 3).copy()
@@ -438,3 +439,14 @@ def _get_mesh_connectivity(msh: Any) -> np.ndarray:
     msh.topology.create_connectivity(tdim, 0)
     c2v = msh.topology.connectivity(tdim, 0)
     return c2v.array.reshape(-1, 4).astype(np.int64)
+
+
+def _get_interpolation_points(element: Any) -> np.ndarray:
+    """Extract interpolation points array across different DOLFINx/basix versions."""
+    pts = getattr(element, "interpolation_points", None)
+    if pts is None:
+        pts = element.interpolation_points()
+    elif callable(pts):
+        pts = pts()
+    return pts
+
