@@ -1,0 +1,140 @@
+# =============================================================================
+# DESIGN CONSTRAINT: No Monte Carlo aggregation anywhere in this pipeline.
+# Every sample = one geometry + one load configuration + one FEM solve.
+# Load-magnitude variants are generated via EXACT linear scaling of a single
+# solve's result, not independent re-solves. This preserves physical coherence
+# trivially, by construction. See ADR-006 in gnn_project_version_2 for the
+# analysis that motivated this decision.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Material — Domex 420MC structural steel
+# ---------------------------------------------------------------------------
+# Numeric accuracy: CONFIRMED (2026-08-18)
+#   Sources: SSAB Domex 420MC datasheet, Eurocode 3 (EN 1993-1-1)
+#   E=210 GPa, nu=0.3, sigma_yield=420 MPa are standard values for this grade.
+# Representativeness for Volvo component scope: OPEN
+#   Whether Domex 420MC is the right material to target for the actual Volvo
+#   components has not been confirmed. See implementation_plan_corrections.md
+#   Section 3 for the question to ask your supervisor.
+material:
+  E: 210.0e+9            # Young's modulus [Pa]
+  nu: 0.3               # Poisson's ratio [-]
+  sigma_yield: 420.0e+6  # Yield strength [Pa]
+  UTS: 480.0e+6          # Ultimate tensile strength [Pa] — min of 480-620 range
+
+# ---------------------------------------------------------------------------
+# Scale — object bounding-box characteristic length
+# ---------------------------------------------------------------------------
+scale:
+  characteristic_length_range: [0.02, 2.0]   # [m] — 20mm to 2m
+  mesh_size_fraction: 0.05                    # mesh_size = fraction × char_length
+  buckets: ["small", "medium", "large"]
+  bucket_boundaries: [0.02, 0.15, 0.6, 2.0]  # 3 buckets: [0.02,0.15), [0.15,0.6), [0.6,2.0]
+
+# ---------------------------------------------------------------------------
+# Geometry families
+# ---------------------------------------------------------------------------
+geometry:
+  families:
+    - block_with_holes
+    - l_bracket
+    - elongated_bar
+    - block_with_fillet
+  family_weights: [0.25, 0.25, 0.25, 0.25]
+
+# ---------------------------------------------------------------------------
+# Per-family shape parameter ranges
+# ---------------------------------------------------------------------------
+block_with_holes:
+  base_dims_range: [0.8, 1.2]       # multiplier on characteristic_length per axis
+  hole_count_range: [1, 4]
+  hole_radius_fraction: [0.05, 0.20] # fraction of smallest face dimension
+  aspect_ratio_range: [0.5, 2.0]     # length:width ratio
+
+l_bracket:
+  notch_depth_fraction: [0.25, 0.50] # fraction of block height
+  notch_width_fraction: [0.25, 0.50] # fraction of block width
+  radius_ratio_range: [0.02, 0.30]   # r/d — Peterson's valid range
+  radius_ratio_holdout: [0.10, 0.20] # test-only sub-range (no train samples)
+
+elongated_bar:
+  min_aspect_ratio: 8.0              # length:cross-section >= 8:1
+  max_aspect_ratio: 15.0
+  cross_section_aspect: [0.5, 2.0]   # width:height of cross-section
+  hole_probability: 0.4              # probability of adding holes
+
+
+
+block_with_fillet:
+  fillet_radius_fraction: [0.05, 0.25]  # fraction of shortest edge
+  num_fillets_range: [1, 4]             # how many edges to fillet
+
+# ---------------------------------------------------------------------------
+# Load scaling — reference-solve + linear-scaling sweep
+# ---------------------------------------------------------------------------
+load_scaling:
+  stress_percentile: 95                         # use P95 von Mises as denominator
+  safety_factor_targets: [1.2, 1.5, 2.0, 3.0, 5.0]  # all >= 1.0
+  peak_stress_cap: 432.0e+6                      # 0.9 × min(UTS) — discard if exceeded
+
+# ---------------------------------------------------------------------------
+# Geometric-linearity gate — mode-aware (opus Task 2)
+# ---------------------------------------------------------------------------
+linearity_gate:
+  bulk_families: [block_with_holes, block_with_fillet, l_bracket]
+  bending_families: [elongated_bar]
+  bulk_threshold: 0.05              # delta/L for bulk families
+  bending_length_threshold: 0.05    # delta/L still checked for bending families
+  bending_thickness_threshold: 0.5  # delta/t — half-thickness rule
+
+# ---------------------------------------------------------------------------
+# Sampling — stratum-aware generation
+# ---------------------------------------------------------------------------
+sampling:
+  min_base_samples_per_stratum: 250  # 15 strata × 250 = 3750 base minimum
+  total_target_base_samples: 5000
+  random_seed: 42
+
+# ---------------------------------------------------------------------------
+# Train/val/test splitting
+# ---------------------------------------------------------------------------
+splitting:
+  ratios: [0.80, 0.10, 0.10]
+  large_scale_holdout_fraction: 0.5  # fraction of large-bucket base samples -> test
+
+# ---------------------------------------------------------------------------
+# Calibration & verification
+# ---------------------------------------------------------------------------
+calibration:
+  pilot_samples: 30
+  linearity_verification_sample_rate: 0.01  # fraction of base samples to re-solve
+  linearity_tolerance: 0.01                 # 1% relative error
+  max_family_failure_rate: 0.05             # 5% — halt if exceeded
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+validation:
+  coherence_tolerance: 0.05
+  coherence_tolerance_overrides:
+    elongated_bar: 0.065   # bending family, ~5.8% observed + margin
+  max_local_strain_diagnostic: 0.02
+  max_graph_diameter_warning: null
+  min_multihot_samples: 50
+# ---------------------------------------------------------------------------
+# FEM solver settings
+# ---------------------------------------------------------------------------
+solver:
+  element_degree: 2                   # CG2 function space (quadratic tet10)
+  reference_load_magnitude: 200.0    # [N] — small reference traction for unit solve
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+output:
+  hdf5_dir: "output/raw"
+  geometry_dir: "output/geometries"
+  manifest_path: "output/manifest.csv"
+  log_dir: "logs"
+  progress_interval: 50               # log every N samples

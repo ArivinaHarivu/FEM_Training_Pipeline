@@ -1,0 +1,12 @@
+# Dataset generation pipeline dependencies.
+# FEniCS/Dolfin is installed separately via fem-on-colab (not pip).
+# Do NOT add torch, torch-geometric, or main_package — this is data generation only.
+
+gmsh>=4.11
+meshio>=5.3
+numpy>=1.24
+pandas>=2.0
+networkx>=3.0
+pyyaml>=6.0
+h5py>=3.8
+scipy>=1.10

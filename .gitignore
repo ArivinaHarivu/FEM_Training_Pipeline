@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output datasets and large mesh files generated during runs (root output folder only)
+/output/
+*.h5
+*.hdf5
+*.msh
+*.xdmf
+*.log
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+#conda env
+**/miniconda.sh
