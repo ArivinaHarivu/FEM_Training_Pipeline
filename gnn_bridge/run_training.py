@@ -110,21 +110,30 @@ def main() -> None:
     # ----- Model -----
     model_cfg = config.get("model", {})
 
-    # Import model — try from gnn_project_version_2 first, fallback to inline
+    # Import model — search all candidate locations (Colab root, sibling directory, cwd)
+    candidates = [
+        Path("/content/gnn_project_version_2"),
+        Path(__file__).resolve().parent.parent.parent / "gnn_project_version_2",
+        Path(__file__).resolve().parent.parent / "gnn_project_version_2",
+        Path.cwd() / "gnn_project_version_2",
+        Path.cwd().parent / "gnn_project_version_2",
+    ]
+    for p in candidates:
+        if p.exists() and str(p) not in sys.path:
+            sys.path.insert(0, str(p))
+
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gnn_project_version_2"))
         from models.meshgraphnet import MeshGraphNet
         from models.loss import MeshGraphNetLoss
         logger.info("Loaded MeshGraphNet from gnn_project_version_2")
     except ImportError:
         try:
-            # Colab: gnn project may be at a different path
             from meshgraphnet import MeshGraphNet
             from loss import MeshGraphNetLoss
-        except ImportError:
+        except ImportError as e:
             logger.error(
-                "Cannot import MeshGraphNet. Ensure gnn_project_version_2 "
-                "is on sys.path or install the models package."
+                "Cannot import MeshGraphNet (%s). Ensure gnn_project_version_2 is on sys.path.",
+                e,
             )
             sys.exit(1)
 
