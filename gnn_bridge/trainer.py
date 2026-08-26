@@ -256,42 +256,50 @@ class Trainer:
         total_batches = len(self.train_loader)
 
         for i, batch in enumerate(self.train_loader):
-            batch = batch.to(self.device)
-            self.optimizer.zero_grad()
+            try:
+                batch = batch.to(self.device)
+                self.optimizer.zero_grad()
 
-            # Forward
-            preds = self.model(batch)
+                # Forward
+                preds = self.model(batch)
 
-            # Build targets dict from batch
-            targets = self._extract_targets(batch)
+                # Build targets dict from batch
+                targets = self._extract_targets(batch)
 
-            # Loss
-            losses = self.loss_fn(preds, targets)
+                # Loss
+                losses = self.loss_fn(preds, targets)
 
-            if self.loss_balancer is not None:
-                backward_loss, weights = self.loss_balancer.combine(losses)
-                for k, w in weights.items():
-                    weight_accum[k] = weight_accum.get(k, 0.0) + w
-            else:
-                backward_loss = losses["total"]
+                if self.loss_balancer is not None:
+                    backward_loss, weights = self.loss_balancer.combine(losses)
+                    for k, w in weights.items():
+                        weight_accum[k] = weight_accum.get(k, 0.0) + w
+                else:
+                    backward_loss = losses["total"]
 
-            backward_loss.backward()
+                backward_loss.backward()
 
-            # Gradient clipping
-            if self.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.grad_clip_norm,
-                )
+                # Gradient clipping
+                if self.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.grad_clip_norm,
+                    )
 
-            self.optimizer.step()
+                self.optimizer.step()
 
-            # Accumulate raw losses
-            for k, v in losses.items():
-                accum[k] = accum.get(k, 0.0) + v.item()
-            n_batches += 1
+                # Accumulate raw losses
+                for k, v in losses.items():
+                    accum[k] = accum.get(k, 0.0) + v.item()
+                n_batches += 1
 
-            if (i + 1) % 25 == 0 or (i + 1) == total_batches:
-                logger.info("  [Batch %3d/%d] current loss: %.4f", i + 1, total_batches, backward_loss.item())
+                if (i + 1) % 25 == 0 or (i + 1) == total_batches:
+                    logger.info("  [Batch %3d/%d] current loss: %.4f", i + 1, total_batches, backward_loss.item())
+
+            except torch.cuda.OutOfMemoryError:
+                logger.warning("  ⚠ Batch %d/%d exceeded memory limits; skipping sample and freeing cache...", i + 1, total_batches)
+                self.optimizer.zero_grad()
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
 
         n = max(n_batches, 1)
         self._last_train_weights = {k: v / n for k, v in weight_accum.items()}
@@ -305,14 +313,19 @@ class Trainer:
         n_batches = 0
 
         for batch in self.val_loader:
-            batch = batch.to(self.device)
-            preds = self.model(batch)
-            targets = self._extract_targets(batch)
-            losses = self.loss_fn(preds, targets)
+            try:
+                batch = batch.to(self.device)
+                preds = self.model(batch)
+                targets = self._extract_targets(batch)
+                losses = self.loss_fn(preds, targets)
 
-            for k, v in losses.items():
-                accum[k] = accum.get(k, 0.0) + v.item()
-            n_batches += 1
+                for k, v in losses.items():
+                    accum[k] = accum.get(k, 0.0) + v.item()
+                n_batches += 1
+            except torch.cuda.OutOfMemoryError:
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
 
         return {k: v / max(n_batches, 1) for k, v in accum.items()}
 
