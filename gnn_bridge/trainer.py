@@ -206,7 +206,7 @@ class Trainer:
             epoch_start = time.perf_counter()
 
             # --- Train ---
-            train_metrics = self._train_epoch()
+            train_metrics = self._train_epoch(epoch)
 
             # --- Validate ---
             val_metrics = {}
@@ -247,7 +247,7 @@ class Trainer:
 
         return history
 
-    def _train_epoch(self) -> dict[str, float]:
+    def _train_epoch(self, epoch: int = 1) -> dict[str, float]:
         """Run one training epoch."""
         self.model.train()
         accum: dict[str, float] = {}
@@ -293,6 +293,9 @@ class Trainer:
 
                 if (i + 1) % 25 == 0 or (i + 1) == total_batches:
                     logger.info("  [Batch %3d/%d] current loss: %.4f", i + 1, total_batches, backward_loss.item())
+
+                if (i + 1) % 100 == 0:
+                    self._save_checkpoint(epoch=epoch, val_loss=0.0, filename="checkpoint_latest.pt")
 
             except torch.cuda.OutOfMemoryError:
                 logger.warning("  ⚠ Batch %d/%d exceeded memory limits; skipping sample and freeing cache...", i + 1, total_batches)
@@ -344,7 +347,11 @@ class Trainer:
         return targets
 
     def _save_checkpoint(
-        self, epoch: int, val_loss: float, is_best: bool = False,
+        self,
+        epoch: int,
+        val_loss: float,
+        is_best: bool = False,
+        filename: str | None = None,
     ) -> None:
         """Save model checkpoint."""
         state = {
@@ -354,6 +361,11 @@ class Trainer:
             "scheduler_state_dict": self.scheduler.state_dict(),
             "val_loss": val_loss,
         }
+        if filename:
+            path = self.checkpoint_dir / filename
+            torch.save(state, path)
+            return
+
         path = self.checkpoint_dir / f"checkpoint_epoch_{epoch:03d}.pt"
         torch.save(state, path)
 
