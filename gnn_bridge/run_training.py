@@ -47,6 +47,8 @@ def main() -> None:
                         help="Path to GNN config.yaml (optional)")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--hidden_dim", type=int, default=None,
+                        help="Model hidden dimension (e.g. 64 or 128)")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", type=str, default=None,
                         help="'cuda' or 'cpu' (auto-detected if omitted)")
@@ -140,11 +142,17 @@ def main() -> None:
             )
             sys.exit(1)
 
+    hidden_dim = (
+        args.hidden_dim
+        if args.hidden_dim is not None
+        else model_cfg.get("hidden_dim", 64)
+    )
+
     model = MeshGraphNet(
         node_in_dim=model_cfg.get("node_in_dim", 11),
         edge_in_dim=model_cfg.get("edge_in_dim", 4),
         global_in_dim=model_cfg.get("global_in_dim", 1),
-        hidden_dim=model_cfg.get("hidden_dim", 128),
+        hidden_dim=hidden_dim,
         num_processor_layers=model_cfg.get("num_processor_layers", 15),
         stress_net_local_mp_layers=model_cfg.get("stress_net_local_mp_layers", 3),
         E=material_cfg.get("E", 210e9),
