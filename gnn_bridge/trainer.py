@@ -253,8 +253,9 @@ class Trainer:
         accum: dict[str, float] = {}
         weight_accum: dict[str, float] = {}
         n_batches = 0
+        total_batches = len(self.train_loader)
 
-        for batch in self.train_loader:
+        for i, batch in enumerate(self.train_loader):
             batch = batch.to(self.device)
             self.optimizer.zero_grad()
 
@@ -288,6 +289,9 @@ class Trainer:
             for k, v in losses.items():
                 accum[k] = accum.get(k, 0.0) + v.item()
             n_batches += 1
+
+            if (i + 1) % 25 == 0 or (i + 1) == total_batches:
+                logger.info("  [Batch %3d/%d] current loss: %.4f", i + 1, total_batches, backward_loss.item())
 
         n = max(n_batches, 1)
         self._last_train_weights = {k: v / n for k, v in weight_accum.items()}

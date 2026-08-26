@@ -132,10 +132,8 @@ def _extract_edges_from_tet10(connectivity: np.ndarray) -> np.ndarray:
     respectively.
 
     Each parent tet edge is represented as *two* graph edges
-    (corner -> mid-edge-node, mid-edge-node -> corner) rather than one
-    direct corner-corner edge, so every node — including the 6 mid-edge
-    nodes per element — ends up with message-passing edges reaching it.
-    This gives 12 undirected segments per element (6 parent edges x 2).
+    (corner -> mid-edge-node, mid-edge-node -> corner), giving 12 undirected
+    segments per element (6 parent edges x 2).
 
     Parameters
     ----------
@@ -147,31 +145,24 @@ def _extract_edges_from_tet10(connectivity: np.ndarray) -> np.ndarray:
     np.ndarray
         Shape ``(2, num_edges)`` — bidirectional, deduplicated.
     """
-    # (corner_a, mid_node_local_idx, corner_b) for each of the 6 tet edges
-    edge_segments = [
-        (0, 4, 1),  # edge (0,1)
-        (1, 5, 2),  # edge (1,2)
-        (0, 6, 2),  # edge (0,2)
-        (0, 7, 3),  # edge (0,3)
-        (1, 8, 3),  # edge (1,3)
-        (2, 9, 3),  # edge (2,3)
-    ]
-
-    edges = set()
-    for a, m, b in edge_segments:
-        for row in connectivity:
-            na, nm, nb = int(row[a]), int(row[m]), int(row[b])
-            for u, v in ((na, nm), (nm, nb)):
-                if u > v:
-                    u, v = v, u
-                edges.add((u, v))
-
-    if not edges:
+    if connectivity.shape[0] == 0:
         return np.zeros((2, 0), dtype=np.int64)
 
-    arr = np.array(sorted(edges), dtype=np.int64)  # (num_unique, 2)
-    bidir = np.concatenate([arr, arr[:, ::-1]], axis=0)
-    return bidir.T  # (2, num_edges)
+    # 12 directed segments per tet
+    pairs = np.array([
+        [0, 4], [4, 1],
+        [1, 5], [5, 2],
+        [0, 6], [6, 2],
+        [0, 7], [7, 3],
+        [1, 8], [8, 3],
+        [2, 9], [9, 3],
+    ], dtype=np.int64)
+
+    raw_edges = connectivity[:, pairs].reshape(-1, 2)
+    sorted_edges = np.sort(raw_edges, axis=1)
+    unique_edges = np.unique(sorted_edges, axis=0)
+    bidir = np.concatenate([unique_edges, unique_edges[:, ::-1]], axis=0)
+    return bidir.T
 
 
 def _bfs_distances(
@@ -463,9 +454,27 @@ class FEMGraphDataset:
         df = pd.read_csv(manifest_path)
 
         if "split" not in df.columns:
-            raise ValueError(
-                "Manifest must have a 'split' column. Run split_strategy first."
+            logger.warning(
+                "Manifest %s missing 'split' column. Auto-assigning base-sample-safe 80/10/10 split...",
+                manifest_path,
             )
+            base_ids = df["base_sample_id"].unique() if "base_sample_id" in df.columns else df["sample_id"].unique()
+            rng = np.random.default_rng(42)
+            rng.shuffle(base_ids)
+            n_train = max(1, int(0.8 * len(base_ids)))
+            n_val = max(1, int(0.1 * len(base_ids)))
+            train_bases = set(base_ids[:n_train])
+            val_bases = set(base_ids[n_train:n_train + n_val])
+
+            id_col = "base_sample_id" if "base_sample_id" in df.columns else "sample_id"
+            df["split"] = df[id_col].apply(
+                lambda b: "train" if b in train_bases else ("val" if b in val_bases else "test")
+            )
+            try:
+                df.to_csv(manifest_path, index=False)
+                logger.info("Saved 'split' column to %s: %s", manifest_path, df["split"].value_counts().to_dict())
+            except Exception as e:
+                logger.warning("Could not write 'split' to manifest file (%s); using in-memory split", e)
 
         split_df = df[df["split"] == split]
 
@@ -549,7 +558,7 @@ def create_dataloaders(
 
 def compute_field_stds(
     dataset: FEMGraphDataset,
-    max_samples: int = 500,
+    max_samples: int = 50,
 ) -> dict[str, float]:
     """Compute per-field standard deviations from training data.
 
