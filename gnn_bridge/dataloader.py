@@ -20,6 +20,16 @@ Global features (1-dim):
 
 Targets:
     y_displacement (N, 3), y_stress (N, 6), y_von_mises (N,)
+
+``elem_conn`` is now the **tet10** connectivity (E, 10), read from the
+H5 file's ``Facets_tet10`` dataset, not the tet4 corner-only ``Facets``.
+This is required by ``physics_bridge.py``'s nodal-strain evaluation,
+which needs each element's 6 mid-edge nodes as well as its 4 corners —
+using tet4 connectivity would silently drop the mid-edge nodes out of
+the graph (no edges reaching them) and out of the physics bridge (no
+per-node strain estimate at them). Mesh edges are built from the tet10
+connectivity too, so every node — corner or mid-edge — has message-
+passing edges reaching it.
 """
 
 from __future__ import annotations
@@ -78,7 +88,11 @@ class MeshData(Data):
 # ---------------------------------------------------------------------------
 
 def _extract_edges_from_tetra(connectivity: np.ndarray) -> np.ndarray:
-    """Extract unique bidirectional edge_index from tetrahedral connectivity.
+    """[Legacy, tet4-only] Extract bidirectional edge_index from tetrahedral connectivity.
+
+    Not used by ``h5_to_meshdata`` anymore — see ``_extract_edges_from_tet10``.
+    Kept only in case some other caller still passes tet4 (corner-only,
+    4-node) connectivity.
 
     Parameters
     ----------
@@ -106,6 +120,57 @@ def _extract_edges_from_tetra(connectivity: np.ndarray) -> np.ndarray:
     arr = np.array(sorted(edges), dtype=np.int64)  # (num_unique, 2)
     # Make bidirectional
     bidir = np.concatenate([arr, arr[:, ::-1]], axis=0)  # (2*num_unique, 2)
+    return bidir.T  # (2, num_edges)
+
+
+def _extract_edges_from_tet10(connectivity: np.ndarray) -> np.ndarray:
+    """Extract unique bidirectional edge_index from tet10 connectivity.
+
+    Node ordering (VTK_QUADRATIC_TETRA / meshio "tetra10", matching
+    ``physics_bridge.py``): local indices 0-3 are corners, 4-9 are the
+    mid-edge nodes of edges (0,1), (1,2), (0,2), (0,3), (1,3), (2,3)
+    respectively.
+
+    Each parent tet edge is represented as *two* graph edges
+    (corner -> mid-edge-node, mid-edge-node -> corner) rather than one
+    direct corner-corner edge, so every node — including the 6 mid-edge
+    nodes per element — ends up with message-passing edges reaching it.
+    This gives 12 undirected segments per element (6 parent edges x 2).
+
+    Parameters
+    ----------
+    connectivity : np.ndarray
+        Shape ``(E_elem, 10)`` — tet10 node indices.
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``(2, num_edges)`` — bidirectional, deduplicated.
+    """
+    # (corner_a, mid_node_local_idx, corner_b) for each of the 6 tet edges
+    edge_segments = [
+        (0, 4, 1),  # edge (0,1)
+        (1, 5, 2),  # edge (1,2)
+        (0, 6, 2),  # edge (0,2)
+        (0, 7, 3),  # edge (0,3)
+        (1, 8, 3),  # edge (1,3)
+        (2, 9, 3),  # edge (2,3)
+    ]
+
+    edges = set()
+    for a, m, b in edge_segments:
+        for row in connectivity:
+            na, nm, nb = int(row[a]), int(row[m]), int(row[b])
+            for u, v in ((na, nm), (nm, nb)):
+                if u > v:
+                    u, v = v, u
+                edges.add((u, v))
+
+    if not edges:
+        return np.zeros((2, 0), dtype=np.int64)
+
+    arr = np.array(sorted(edges), dtype=np.int64)  # (num_unique, 2)
+    bidir = np.concatenate([arr, arr[:, ::-1]], axis=0)
     return bidir.T  # (2, num_edges)
 
 
@@ -153,7 +218,53 @@ def _compute_hop_features(
     return np.column_stack([hops_bc_norm, hops_load_norm])
 
 
-def h5_to_meshdata(file_path: str | Path, dtype: str = "float32") -> MeshData:
+def stress_to_strain(
+    stress_voigt: np.ndarray, E: float, nu: float,
+) -> np.ndarray:
+    """Invert isotropic Hooke's law: ground-truth Voigt stress -> strain.
+
+    Matches the engineering-shear convention in physics_bridge.py's
+    ``hookes_law_stress`` (its forward direction: eps -> sigma). This
+    is its algebraic inverse, so loss.py's ``L_eps``/``L_eps_corr``
+    terms compare against a real target instead of never firing
+    because no ``"eps"`` key exists in ``targets``.
+
+    Parameters
+    ----------
+    stress_voigt : np.ndarray
+        ``(N, 6)`` Voigt stress [xx, yy, zz, xy, yz, xz].
+    E : float
+        Young's modulus.
+    nu : float
+        Poisson's ratio.
+
+    Returns
+    -------
+    np.ndarray
+        ``(N, 6)`` Voigt engineering strain, same component order.
+    """
+    sxx, syy, szz = stress_voigt[:, 0], stress_voigt[:, 1], stress_voigt[:, 2]
+    sxy, syz, sxz = stress_voigt[:, 3], stress_voigt[:, 4], stress_voigt[:, 5]
+
+    exx = (sxx - nu * (syy + szz)) / E
+    eyy = (syy - nu * (sxx + szz)) / E
+    ezz = (szz - nu * (sxx + syy)) / E
+
+    # sigma_shear = mu * gamma_shear (engineering shear)  =>  gamma = sigma / mu
+    mu = E / (2 * (1 + nu))
+    gxy = sxy / mu
+    gyz = syz / mu
+    gxz = sxz / mu
+
+    return np.column_stack([exx, eyy, ezz, gxy, gyz, gxz])
+
+
+def h5_to_meshdata(
+    file_path: str | Path,
+    dtype: str = "float32",
+    E: float | None = None,
+    nu: float | None = None,
+) -> MeshData:
     """Convert a single Training Pipeline HDF5 file to a PyG MeshData.
 
     This is self-contained — no dependency on the GNN project's parsers.
@@ -164,6 +275,17 @@ def h5_to_meshdata(file_path: str | Path, dtype: str = "float32") -> MeshData:
         Path to the ``.h5`` file.
     dtype : str
         Torch float dtype. Default ``"float32"``.
+    E : float, optional
+        Young's modulus (Pa). If provided along with ``nu``, ground-
+        truth Voigt strain is derived from ``StressVoigt`` via inverse
+        Hooke's law and attached as ``data.y_strain`` (N, 6) — needed
+        for loss.py's ``L_eps``/``L_eps_corr`` terms to activate at
+        all (they silently no-op without a ``"eps"`` target). Must
+        match the material constants ``PhysicsBridge`` is constructed
+        with, or the derived target and the model's internal
+        assumption disagree.
+    nu : float, optional
+        Poisson's ratio. See ``E``.
 
     Returns
     -------
@@ -174,8 +296,18 @@ def h5_to_meshdata(file_path: str | Path, dtype: str = "float32") -> MeshData:
 
     with h5py.File(str(file_path), "r") as f:
         vertices = np.array(f["Vertices"], dtype=np.float64)  # (N, 3)
-        connectivity = np.array(f["Facets"], dtype=np.int64)  # (E, 4)
         num_nodes = vertices.shape[0]
+
+        if "Facets_tet10" in f:
+            connectivity = np.array(f["Facets_tet10"], dtype=np.int64)  # (E, 10)
+        else:
+            connectivity = np.array(f["Facets"], dtype=np.int64)
+
+        if connectivity.ndim != 2 or connectivity.shape[1] not in (4, 10):
+            raise ValueError(
+                f"{file_path}: 'Facets' has shape "
+                f"{connectivity.shape}, expected (E, 10) or (E, 4)."
+            )
 
         # --- Boundary / load / surface flags ---
         is_fixed = (
@@ -222,8 +354,11 @@ def h5_to_meshdata(file_path: str | Path, dtype: str = "float32") -> MeshData:
         else:
             total_load_mag = 0.0
 
-    # --- Edge index ---
-    edge_index_np = _extract_edges_from_tetra(connectivity)
+    # --- Edge index (tet10: reaches corner + mid-edge nodes) ---
+    if connectivity.shape[1] == 10:
+        edge_index_np = _extract_edges_from_tet10(connectivity)
+    else:
+        edge_index_np = _extract_edges_from_tetra(connectivity)
 
     # --- Hop features ---
     bc_mask = is_fixed.astype(bool)
@@ -263,6 +398,9 @@ def h5_to_meshdata(file_path: str | Path, dtype: str = "float32") -> MeshData:
         data.y_displacement = torch.as_tensor(displacement, dtype=torch_dtype)
     if stress is not None:
         data.y_stress = torch.as_tensor(stress, dtype=torch_dtype)
+        if E is not None and nu is not None:
+            strain = stress_to_strain(stress, E, nu)
+            data.y_strain = torch.as_tensor(strain, dtype=torch_dtype)
     if von_mises is not None:
         data.y_von_mises = torch.as_tensor(von_mises, dtype=torch_dtype)
 
@@ -296,6 +434,8 @@ class FEMGraphDataset:
         manifest_path: str | Path | None = None,
         split: str | None = None,
         file_list: list[str] | None = None,
+        E: float | None = None,
+        nu: float | None = None,
     ):
         if file_list is not None:
             self._files = [Path(f) for f in file_list]
@@ -307,6 +447,9 @@ class FEMGraphDataset:
             self._files = sorted(Path(h5_dir).glob("*.h5"))
         else:
             raise ValueError("Provide h5_dir, manifest_path+split, or file_list")
+
+        self._E = E
+        self._nu = nu
 
         logger.info("FEMGraphDataset: %d files for split=%s", len(self._files), split)
 
@@ -343,7 +486,7 @@ class FEMGraphDataset:
         return len(self._files)
 
     def __getitem__(self, idx: int) -> MeshData:
-        return h5_to_meshdata(self._files[idx])
+        return h5_to_meshdata(self._files[idx], E=self._E, nu=self._nu)
 
     @property
     def file_paths(self) -> list[Path]:
@@ -355,6 +498,8 @@ def create_dataloaders(
     manifest_path: str | Path,
     batch_size: int = 4,
     num_workers: int = 0,
+    E: float | None = None,
+    nu: float | None = None,
 ) -> dict[str, PyGDataLoader]:
     """Create train/val/test DataLoaders from manifest + H5 directory.
 
@@ -380,6 +525,8 @@ def create_dataloaders(
             h5_dir=h5_dir,
             manifest_path=manifest_path,
             split=split,
+            E=E,
+            nu=nu,
         )
         if len(ds) == 0:
             logger.warning("No files for split '%s'", split)
@@ -420,7 +567,7 @@ def compute_field_stds(
     dict[str, float]
         Keys: ``"u"``, ``"sigma"``, ``"eps"``, ``"vm"``.
     """
-    u_vals, sigma_vals, vm_vals = [], [], []
+    u_vals, sigma_vals, strain_vals, vm_vals = [], [], [], []
 
     n = min(len(dataset), max_samples)
     for i in range(n):
@@ -429,6 +576,8 @@ def compute_field_stds(
             u_vals.append(data.y_displacement.numpy().ravel())
         if hasattr(data, "y_stress"):
             sigma_vals.append(data.y_stress.numpy().ravel())
+        if hasattr(data, "y_strain"):
+            strain_vals.append(data.y_strain.numpy().ravel())
         if hasattr(data, "y_von_mises"):
             vm_vals.append(data.y_von_mises.numpy().ravel())
 
@@ -436,7 +585,7 @@ def compute_field_stds(
     stds = {
         "u": max(float(np.std(np.concatenate(u_vals))), eps) if u_vals else 1.0,
         "sigma": max(float(np.std(np.concatenate(sigma_vals))), eps) if sigma_vals else 1.0,
-        "eps": 1.0,  # strain not directly in H5; derived by physics bridge
+        "eps": max(float(np.std(np.concatenate(strain_vals))), eps) if strain_vals else 1.0,
         "vm": max(float(np.std(np.concatenate(vm_vals))), eps) if vm_vals else 1.0,
     }
 

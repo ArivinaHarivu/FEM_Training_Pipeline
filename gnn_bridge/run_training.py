@@ -53,6 +53,13 @@ def main() -> None:
                         help="Path to checkpoint .pt to resume from")
     parser.add_argument("--eval_only", action="store_true",
                         help="Skip training, run evaluation only")
+    parser.add_argument("--no_adaptive_loss", action="store_true",
+                        help="Disable live adaptive loss-term rebalancing "
+                             "(on by default) and use loss_fn's static "
+                             "w_u/w_sigma/... weights as-is")
+    parser.add_argument("--loss_balance_momentum", type=float, default=0.9,
+                        help="EMA momentum for adaptive loss-term "
+                             "rebalancing (higher = smoother/slower to react)")
     args = parser.parse_args()
 
     # ----- Load config -----
@@ -70,12 +77,19 @@ def main() -> None:
     from gnn_bridge.trainer import Trainer
     from gnn_bridge.metrics import evaluate_model, print_evaluation_report
 
+    # ----- Material constants -----
+    material_cfg = config.get("material", {})
+    mat_E = material_cfg.get("E", 210e9)
+    mat_nu = material_cfg.get("nu", 0.3)
+
     # ----- DataLoaders -----
     logger.info("Creating DataLoaders from %s", args.h5_dir)
     loaders = create_dataloaders(
         h5_dir=args.h5_dir,
         manifest_path=args.manifest,
         batch_size=args.batch_size,
+        E=mat_E,
+        nu=mat_nu,
     )
 
     if "train" not in loaders:
@@ -88,12 +102,13 @@ def main() -> None:
         h5_dir=args.h5_dir,
         manifest_path=args.manifest,
         split="train",
+        E=mat_E,
+        nu=mat_nu,
     )
     field_stds = compute_field_stds(train_dataset)
 
     # ----- Model -----
     model_cfg = config.get("model", {})
-    material_cfg = config.get("material", {})
 
     # Import model — try from gnn_project_version_2 first, fallback to inline
     try:
@@ -148,6 +163,8 @@ def main() -> None:
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
         log_dir=args.log_dir,
+        adaptive_loss_weighting=not args.no_adaptive_loss,
+        loss_balance_momentum=args.loss_balance_momentum,
     )
 
     if args.resume:
