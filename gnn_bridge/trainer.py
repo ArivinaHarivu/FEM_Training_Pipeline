@@ -354,16 +354,19 @@ class Trainer:
         filename: str | None = None,
     ) -> None:
         """Save model checkpoint."""
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         state = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
+            "loss_balancer_state_dict": self.loss_balancer.state_dict() if self.loss_balancer else None,
             "val_loss": val_loss,
         }
         if filename:
             path = self.checkpoint_dir / filename
             torch.save(state, path)
+            logger.info("  💾 Auto-saved checkpoint → %s", path)
             return
 
         path = self.checkpoint_dir / f"checkpoint_epoch_{epoch:03d}.pt"
