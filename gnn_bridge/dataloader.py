@@ -495,7 +495,12 @@ class FEMGraphDataset:
         return len(self._files)
 
     def __getitem__(self, idx: int) -> MeshData:
-        return h5_to_meshdata(self._files[idx], E=self._E, nu=self._nu)
+        try:
+            return h5_to_meshdata(self._files[idx], E=self._E, nu=self._nu)
+        except Exception as e:
+            logger.warning("Could not load sample %s (%s); loading fallback sample...", self._files[idx], e)
+            fallback_idx = (idx + 1) % len(self._files)
+            return h5_to_meshdata(self._files[fallback_idx], E=self._E, nu=self._nu)
 
     @property
     def file_paths(self) -> list[Path]:

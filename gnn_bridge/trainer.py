@@ -100,6 +100,24 @@ class AdaptiveLossBalancer:
         combined = sum(weights[k] * terms[k] for k in terms)
         return combined, weights
 
+    def state_dict(self) -> dict[str, Any]:
+        """Return the state of the loss balancer for checkpointing."""
+        return {
+            "momentum": self.momentum,
+            "eps": self.eps,
+            "warmup_steps": self.warmup_steps,
+            "ema": self._ema.copy(),
+            "step": self._step,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore the state of the loss balancer from a checkpoint."""
+        self.momentum = state_dict.get("momentum", self.momentum)
+        self.eps = state_dict.get("eps", self.eps)
+        self.warmup_steps = state_dict.get("warmup_steps", self.warmup_steps)
+        self._ema = state_dict.get("ema", {}).copy()
+        self._step = state_dict.get("step", 0)
+
 
 class Trainer:
     """MeshGraphNet training loop.
@@ -276,6 +294,11 @@ class Trainer:
                 else:
                     backward_loss = losses["total"]
 
+                if not torch.isfinite(backward_loss):
+                    logger.warning("  ⚠ Batch %d/%d produced non-finite loss (NaN/Inf); skipping step to protect weights...", i + 1, total_batches)
+                    self.optimizer.zero_grad()
+                    continue
+
                 backward_loss.backward()
 
                 # Gradient clipping
@@ -353,32 +376,41 @@ class Trainer:
         is_best: bool = False,
         filename: str | None = None,
     ) -> None:
-        """Save model checkpoint."""
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        state = {
-            "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "loss_balancer_state_dict": self.loss_balancer.state_dict() if self.loss_balancer else None,
-            "val_loss": val_loss,
-        }
-        if filename:
-            path = self.checkpoint_dir / filename
-            torch.save(state, path)
-            logger.info("  💾 Auto-saved checkpoint → %s", path)
-            return
+        """Save model checkpoint with atomic write protection."""
+        try:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            state = {
+                "epoch": epoch,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "loss_balancer_state_dict": self.loss_balancer.state_dict() if self.loss_balancer else None,
+                "val_loss": val_loss,
+            }
+            if filename:
+                path = self.checkpoint_dir / filename
+                temp_path = path.with_suffix(".tmp")
+                torch.save(state, temp_path)
+                temp_path.replace(path)
+                logger.info("  💾 Auto-saved checkpoint → %s", path)
+                return
 
-        path = self.checkpoint_dir / f"checkpoint_epoch_{epoch:03d}.pt"
-        torch.save(state, path)
+            path = self.checkpoint_dir / f"checkpoint_epoch_{epoch:03d}.pt"
+            temp_path = path.with_suffix(".tmp")
+            torch.save(state, temp_path)
+            temp_path.replace(path)
 
-        if is_best:
-            best_path = self.checkpoint_dir / "best_model.pt"
-            torch.save(state, best_path)
-            logger.info(
-                "  ★ New best model saved (val_loss=%.6f) → %s",
-                val_loss, best_path,
-            )
+            if is_best:
+                best_path = self.checkpoint_dir / "best_model.pt"
+                best_temp = best_path.with_suffix(".tmp")
+                torch.save(state, best_temp)
+                best_temp.replace(best_path)
+                logger.info(
+                    "  ★ New best model saved (val_loss=%.6f) → %s",
+                    val_loss, best_path,
+                )
+        except Exception as e:
+            logger.error("  ⚠ Checkpoint save failed (%s); continuing training without crashing...", e)
 
     def _log_epoch(
         self,
@@ -424,6 +456,8 @@ class Trainer:
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if "loss_balancer_state_dict" in ckpt and self.loss_balancer and ckpt["loss_balancer_state_dict"]:
+            self.loss_balancer.load_state_dict(ckpt["loss_balancer_state_dict"])
         self._best_val_loss = ckpt.get("val_loss", float("inf"))
         epoch = ckpt.get("epoch", 0)
         logger.info("Loaded checkpoint from epoch %d (val_loss=%.6f)", epoch, self._best_val_loss)

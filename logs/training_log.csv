@@ -1,0 +1,1 @@
+epoch,train_loss,train_L_u,train_L_sigma,train_L_eps,train_L_eps_corr,train_L_vm,val_loss,val_L_u,val_L_sigma,val_L_eps,val_L_eps_corr,val_L_vm,lr,epoch_time_s
