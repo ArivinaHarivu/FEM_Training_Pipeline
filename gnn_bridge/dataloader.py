@@ -637,14 +637,16 @@ class FEMGraphDataset:
 
         # Each sample_id should have an H5 file
         sample_ids = split_df["sample_id"].unique()
-        files = []
-        for sid in sample_ids:
-            if h5_dir is not None:
-                h5_path = h5_dir / f"{sid}.h5"
-                if h5_path.exists():
-                    files.append(h5_path)
-                else:
-                    logger.warning("H5 file not found: %s", h5_path)
+        if h5_dir is not None:
+            # Batch scan directory once instead of thousands of individual FUSE stat() calls
+            existing_names = set(p.name for p in Path(h5_dir).glob("*.h5"))
+            files = [
+                Path(h5_dir) / f"{sid}.h5"
+                for sid in sample_ids
+                if f"{sid}.h5" in existing_names
+            ]
+        else:
+            files = []
 
         return sorted(files)
 

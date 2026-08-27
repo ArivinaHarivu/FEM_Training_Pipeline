@@ -446,7 +446,7 @@ class Trainer:
                     accum[k] = accum.get(k, 0.0) + v.item()
                 n_batches += 1
 
-                if (curr_batch_idx + 1) % 25 == 0 or (curr_batch_idx + 1) == total_batches:
+                if (curr_batch_idx + 1) == 1 or (curr_batch_idx + 1) % 10 == 0 or (curr_batch_idx + 1) == total_batches:
                     logger.info(
                         "  [Batch %3d/%d] current loss: %.4f",
                         curr_batch_idx + 1, total_batches, backward_loss.item(),
