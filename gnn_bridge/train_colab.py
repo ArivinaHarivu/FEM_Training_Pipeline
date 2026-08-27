@@ -225,14 +225,22 @@ trainer = Trainer(
     checkpoint_dir=CHECKPOINT_DIR,
     log_dir=LOG_DIR,
     adaptive_loss_weighting=True,
+    checkpoint_interval_batches=25,
 )
+
+# Auto-resume if previous session was interrupted / disconnected
+resume_state = trainer.resume_latest()
+if resume_state:
+    print(f"✓ Resuming training from Epoch {resume_state['next_epoch']}, Batch {resume_state['start_batch']}!")
+else:
+    print("Starting fresh training run...")
 
 print(f"\n{'=' * 65}")
 print(f"  STARTING TRAINING: {NUM_EPOCHS} epochs, lr={LR}, batch_size={BATCH_SIZE}")
 print(f"  Device: {device} | Adaptive Loss Balancer: Active")
 print(f"{'=' * 65}\n")
 
-history = trainer.train(num_epochs=NUM_EPOCHS)
+history = trainer.train(num_epochs=NUM_EPOCHS, resume_state=resume_state)
 
 
 # ===========================================================================

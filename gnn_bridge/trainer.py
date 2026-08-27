@@ -16,10 +16,12 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import random
 import time
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -120,7 +122,7 @@ class AdaptiveLossBalancer:
 
 
 class Trainer:
-    """MeshGraphNet training loop.
+    """MeshGraphNet training loop with intra-epoch batch resumption.
 
     Parameters
     ----------
@@ -129,19 +131,25 @@ class Trainer:
     loss_fn : nn.Module
         MeshGraphNetLoss instance (with field_stds registered).
     train_loader : DataLoader
-        PyG DataLoader for training.
+        PyG DataLoader for training (preferably with ResumableBatchSampler).
     val_loader : DataLoader, optional
         PyG DataLoader for validation.
     lr : float
         Learning rate. Default 1e-3.
     grad_clip_norm : float
         Max gradient norm for clipping. Default 1.0.
-    device : str
+    device : str, optional
         ``"cuda"`` or ``"cpu"``. Auto-detected if not specified.
     checkpoint_dir : str or Path
         Directory for saving checkpoints.
     log_dir : str or Path
         Directory for CSV training logs.
+    adaptive_loss_weighting : bool
+        Whether to use AdaptiveLossBalancer. Default True.
+    loss_balance_momentum : float
+        EMA momentum for AdaptiveLossBalancer. Default 0.9.
+    checkpoint_interval_batches : int
+        Save a batch-level checkpoint every N batches. Default 50.
     """
 
     def __init__(
@@ -157,6 +165,7 @@ class Trainer:
         log_dir: str | Path = "logs",
         adaptive_loss_weighting: bool = True,
         loss_balance_momentum: float = 0.9,
+        checkpoint_interval_batches: int = 50,
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -185,14 +194,23 @@ class Trainer:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
+        self.checkpoint_interval_batches = max(1, checkpoint_interval_batches)
+        self._global_step: int = 0
         self._best_val_loss = float("inf")
         self._log_file = self.log_dir / "training_log.csv"
         self._weights_log_file = self.log_dir / "adaptive_weights_log.jsonl"
         self._last_train_weights: dict[str, float] = {}
+        self._current_history: dict[str, list[float]] = {
+            "train_loss": [],
+            "val_loss": [],
+            "lr": [],
+        }
         self._init_log()
 
-    def _init_log(self) -> None:
-        """Initialize the CSV log file with headers."""
+    def _init_log(self, force: bool = False) -> None:
+        """Initialize the CSV log file with headers if it does not exist."""
+        if not force and self._log_file.exists() and self._log_file.stat().st_size > 0:
+            return
         with open(self._log_file, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -203,77 +221,187 @@ class Trainer:
                 "lr", "epoch_time_s",
             ])
 
-    def train(self, num_epochs: int = 100) -> dict[str, list[float]]:
-        """Run the full training loop.
+    def train(
+        self,
+        num_epochs: int = 100,
+        start_epoch: int = 1,
+        start_batch: int = 0,
+        resume_state: dict[str, Any] | None = None,
+    ) -> dict[str, list[float]]:
+        """Run the full training loop with support for intra-epoch resumption.
 
         Parameters
         ----------
         num_epochs : int
-            Number of training epochs.
+            Target total number of training epochs.
+        start_epoch : int
+            Epoch to start/resume training at (1-indexed). Default 1.
+        start_batch : int
+            Intra-epoch batch index to resume at (0-indexed). Default 0.
+        resume_state : dict[str, Any], optional
+            Metadata dictionary returned by `load_checkpoint()`. If provided,
+            `start_epoch`, `start_batch`, accumulators, and history are auto-populated.
 
         Returns
         -------
         dict[str, list[float]]
             History of per-epoch metrics.
         """
-        history: dict[str, list[float]] = {
-            "train_loss": [], "val_loss": [], "lr": [],
-        }
+        initial_accum: dict[str, float] = {}
+        initial_weight_accum: dict[str, float] = {}
+        initial_n_batches: int = 0
 
-        for epoch in range(1, num_epochs + 1):
-            epoch_start = time.perf_counter()
+        if resume_state is not None:
+            start_epoch = resume_state.get("next_epoch", start_epoch)
+            start_batch = resume_state.get("start_batch", start_batch)
+            initial_accum = resume_state.get("epoch_accum", {})
+            initial_weight_accum = resume_state.get("weight_accum", {})
+            initial_n_batches = resume_state.get("n_batches", 0)
+            if "history" in resume_state and resume_state["history"]:
+                self._current_history = {
+                    k: list(v) for k, v in resume_state["history"].items()
+                }
 
-            # --- Train ---
-            train_metrics = self._train_epoch(epoch)
+        logger.info(
+            "Starting training run: epochs %d to %d (starting at batch %d)...",
+            start_epoch, num_epochs, start_batch,
+        )
 
-            # --- Validate ---
-            val_metrics = {}
-            if self.val_loader is not None and len(self.val_loader) > 0:
-                val_metrics = self._val_epoch()
+        try:
+            for epoch in range(start_epoch, num_epochs + 1):
+                epoch_start = time.perf_counter()
 
-            epoch_time = time.perf_counter() - epoch_start
-            current_lr = self.optimizer.param_groups[0]["lr"]
+                batch_offset = start_batch if epoch == start_epoch else 0
+                init_acc = initial_accum if epoch == start_epoch else None
+                init_wt = initial_weight_accum if epoch == start_epoch else None
+                init_nb = initial_n_batches if epoch == start_epoch else 0
 
-            # --- Scheduler step ---
-            val_loss = val_metrics.get("total", train_metrics["total"])
-            self.scheduler.step(val_loss)
-
-            # --- Checkpoint ---
-            if val_loss < self._best_val_loss:
-                self._best_val_loss = val_loss
-                self._save_checkpoint(epoch, val_loss, is_best=True)
-
-            # --- Log ---
-            self._log_epoch(epoch, train_metrics, val_metrics, current_lr, epoch_time)
-            self._log_adaptive_weights(epoch)
-            history["train_loss"].append(train_metrics["total"])
-            history["val_loss"].append(val_loss)
-            history["lr"].append(current_lr)
-
-            # --- Console ---
-            val_str = f"val={val_loss:.6f}" if val_metrics else "val=N/A"
-            logger.info(
-                "Epoch %3d/%d | train=%.6f %s | lr=%.2e | %.1fs",
-                epoch, num_epochs, train_metrics["total"],
-                val_str, current_lr, epoch_time,
-            )
-            if self._last_train_weights:
-                weight_str = ", ".join(
-                    f"{k}={w:.2f}" for k, w in sorted(self._last_train_weights.items())
+                # --- Train Epoch ---
+                train_metrics = self._train_epoch(
+                    epoch=epoch,
+                    start_batch=batch_offset,
+                    initial_accum=init_acc,
+                    initial_weight_accum=init_wt,
+                    initial_n_batches=init_nb,
                 )
-                logger.info("  adaptive loss weights (avg this epoch): %s", weight_str)
 
-        return history
+                # --- Validate ---
+                val_metrics = {}
+                if self.val_loader is not None and len(self.val_loader) > 0:
+                    val_metrics = self._val_epoch()
 
-    def _train_epoch(self, epoch: int = 1) -> dict[str, float]:
-        """Run one training epoch."""
+                epoch_time = time.perf_counter() - epoch_start
+                current_lr = self.optimizer.param_groups[0]["lr"]
+
+                # --- Scheduler step ---
+                val_loss = val_metrics.get("total", train_metrics.get("total", 0.0))
+                self.scheduler.step(val_loss)
+
+                # --- Update History & Log ---
+                self._current_history["train_loss"].append(train_metrics.get("total", 0.0))
+                self._current_history["val_loss"].append(val_loss)
+                self._current_history["lr"].append(current_lr)
+                self._log_epoch(epoch, train_metrics, val_metrics, current_lr, epoch_time)
+                self._log_adaptive_weights(epoch)
+
+                # --- Checkpoint best model ---
+                if val_loss < self._best_val_loss:
+                    self._best_val_loss = val_loss
+                    self._save_checkpoint(
+                        epoch=epoch,
+                        val_loss=val_loss,
+                        is_best=True,
+                        batch_idx=-1,
+                        history=self._current_history,
+                    )
+
+                # --- Checkpoint epoch completion ---
+                self._save_checkpoint(
+                    epoch=epoch,
+                    val_loss=val_loss,
+                    is_best=False,
+                    batch_idx=-1,
+                    history=self._current_history,
+                )
+                # Also refresh checkpoint_latest.pt at end of epoch
+                self._save_checkpoint(
+                    epoch=epoch,
+                    val_loss=val_loss,
+                    is_best=False,
+                    filename="checkpoint_latest.pt",
+                    batch_idx=-1,
+                    history=self._current_history,
+                )
+
+                # --- Console ---
+                val_str = f"val={val_loss:.6f}" if val_metrics else "val=N/A"
+                logger.info(
+                    "Epoch %3d/%d | train=%.6f %s | lr=%.2e | %.1fs",
+                    epoch, num_epochs, train_metrics.get("total", 0.0),
+                    val_str, current_lr, epoch_time,
+                )
+                if self._last_train_weights:
+                    weight_str = ", ".join(
+                        f"{k}={w:.2f}" for k, w in sorted(self._last_train_weights.items())
+                    )
+                    logger.info("  adaptive loss weights (avg this epoch): %s", weight_str)
+
+        except KeyboardInterrupt:
+            logger.warning(
+                "Training interrupted by user. Latest progress has been auto-saved to %s/checkpoint_latest.pt",
+                self.checkpoint_dir,
+            )
+
+        return self._current_history
+
+    def _train_epoch(
+        self,
+        epoch: int = 1,
+        start_batch: int = 0,
+        initial_accum: dict[str, float] | None = None,
+        initial_weight_accum: dict[str, float] | None = None,
+        initial_n_batches: int = 0,
+    ) -> dict[str, float]:
+        """Run one training epoch with optional start batch offset."""
         self.model.train()
-        accum: dict[str, float] = {}
-        weight_accum: dict[str, float] = {}
-        n_batches = 0
-        total_batches = len(self.train_loader)
+        accum: dict[str, float] = initial_accum.copy() if initial_accum else {}
+        weight_accum: dict[str, float] = initial_weight_accum.copy() if initial_weight_accum else {}
+        n_batches = initial_n_batches
 
+        sampler = getattr(self.train_loader, "batch_sampler", None)
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+            sampler.set_start_batch(start_batch)
+
+        # Sync epoch to dataset for deterministic worker-independent augmentation
+        dataset = getattr(self.train_loader, "dataset", None)
+        if dataset is not None:
+            if hasattr(dataset, "set_epoch"):
+                dataset.set_epoch(epoch)
+            elif hasattr(dataset, "dataset") and hasattr(dataset.dataset, "set_epoch"):
+                dataset.dataset.set_epoch(epoch)
+
+        if sampler is not None and hasattr(sampler, "total_batches"):
+            total_batches = sampler.total_batches()
+        else:
+            total_batches = len(self.train_loader) if self.train_loader is not None else 0
+
+        if start_batch > 0:
+            logger.info(
+                "  ▶ Resuming epoch %d at batch %d/%d (skipping prior %d batches)...",
+                epoch, start_batch + 1, total_batches, start_batch,
+            )
+
+        curr_batch_idx = start_batch
         for i, batch in enumerate(self.train_loader):
+            # If standard loader without ResumableBatchSampler was passed, fast-forward
+            if sampler is None or not hasattr(sampler, "set_start_batch"):
+                if i < start_batch:
+                    continue
+                curr_batch_idx = i
+            else:
+                curr_batch_idx = start_batch + i
+
             try:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
@@ -281,7 +409,7 @@ class Trainer:
                 # Forward
                 preds = self.model(batch)
 
-                # Build targets dict from batch
+                # Targets
                 targets = self._extract_targets(batch)
 
                 # Loss
@@ -295,7 +423,10 @@ class Trainer:
                     backward_loss = losses["total"]
 
                 if not torch.isfinite(backward_loss):
-                    logger.warning("  ⚠ Batch %d/%d produced non-finite loss (NaN/Inf); skipping step to protect weights...", i + 1, total_batches)
+                    logger.warning(
+                        "  ⚠ Batch %d/%d produced non-finite loss (NaN/Inf); skipping step to protect weights...",
+                        curr_batch_idx + 1, total_batches,
+                    )
                     self.optimizer.zero_grad()
                     continue
 
@@ -308,24 +439,61 @@ class Trainer:
                     )
 
                 self.optimizer.step()
+                self._global_step += 1
 
                 # Accumulate raw losses
                 for k, v in losses.items():
                     accum[k] = accum.get(k, 0.0) + v.item()
                 n_batches += 1
 
-                if (i + 1) % 25 == 0 or (i + 1) == total_batches:
-                    logger.info("  [Batch %3d/%d] current loss: %.4f", i + 1, total_batches, backward_loss.item())
+                if (curr_batch_idx + 1) % 25 == 0 or (curr_batch_idx + 1) == total_batches:
+                    logger.info(
+                        "  [Batch %3d/%d] current loss: %.4f",
+                        curr_batch_idx + 1, total_batches, backward_loss.item(),
+                    )
 
-                if (i + 1) % 100 == 0:
-                    self._save_checkpoint(epoch=epoch, val_loss=0.0, filename="checkpoint_latest.pt")
+                # Periodic batch-level checkpointing
+                if (curr_batch_idx + 1) % self.checkpoint_interval_batches == 0:
+                    self._save_checkpoint(
+                        epoch=epoch,
+                        batch_idx=curr_batch_idx,
+                        val_loss=0.0,
+                        filename="checkpoint_latest.pt",
+                        epoch_accum=accum,
+                        weight_accum=weight_accum,
+                        n_batches=n_batches,
+                        history=self._current_history,
+                    )
 
             except torch.cuda.OutOfMemoryError:
-                logger.warning("  ⚠ Batch %d/%d exceeded memory limits; skipping sample and freeing cache...", i + 1, total_batches)
+                logger.warning(
+                    "  ⚠ Batch %d/%d exceeded memory limits; skipping sample and freeing cache...",
+                    curr_batch_idx + 1, total_batches,
+                )
                 self.optimizer.zero_grad()
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
                 continue
+            except KeyboardInterrupt:
+                logger.warning(
+                    "  ⚠ KeyboardInterrupt detected at epoch %d, batch %d/%d! Auto-saving checkpoint...",
+                    epoch, curr_batch_idx + 1, total_batches,
+                )
+                self._save_checkpoint(
+                    epoch=epoch,
+                    batch_idx=curr_batch_idx,
+                    val_loss=0.0,
+                    filename="checkpoint_latest.pt",
+                    epoch_accum=accum,
+                    weight_accum=weight_accum,
+                    n_batches=n_batches,
+                    history=self._current_history,
+                )
+                raise
+
+        # Reset sampler start_batch for clean subsequent epochs
+        if sampler is not None and hasattr(sampler, "set_start_batch"):
+            sampler.set_start_batch(0)
 
         n = max(n_batches, 1)
         self._last_train_weights = {k: v / n for k, v in weight_accum.items()}
@@ -372,28 +540,53 @@ class Trainer:
     def _save_checkpoint(
         self,
         epoch: int,
-        val_loss: float,
+        val_loss: float = 0.0,
+        batch_idx: int = -1,
         is_best: bool = False,
         filename: str | None = None,
-    ) -> None:
-        """Save model checkpoint with atomic write protection."""
+        epoch_accum: dict[str, float] | None = None,
+        weight_accum: dict[str, float] | None = None,
+        n_batches: int = 0,
+        history: dict[str, list[float]] | None = None,
+    ) -> Path | None:
+        """Save model checkpoint with atomic write protection and full training state."""
         try:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
             state = {
                 "epoch": epoch,
+                "batch_idx": batch_idx,
+                "global_step": self._global_step,
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
-                "loss_balancer_state_dict": self.loss_balancer.state_dict() if self.loss_balancer else None,
+                "loss_balancer_state_dict": (
+                    self.loss_balancer.state_dict() if self.loss_balancer else None
+                ),
                 "val_loss": val_loss,
+                "best_val_loss": self._best_val_loss,
+                "epoch_accum": epoch_accum if epoch_accum is not None else {},
+                "weight_accum": weight_accum if weight_accum is not None else {},
+                "n_batches": n_batches,
+                "history": history if history is not None else self._current_history,
+                "rng_state": {
+                    "torch": torch.get_rng_state(),
+                    "cuda": (
+                        torch.cuda.get_rng_state_all()
+                        if torch.cuda.is_available()
+                        else None
+                    ),
+                    "numpy": np.random.get_state(),
+                    "python": random.getstate(),
+                },
             }
+
             if filename:
                 path = self.checkpoint_dir / filename
                 temp_path = path.with_suffix(".tmp")
                 torch.save(state, temp_path)
                 temp_path.replace(path)
-                logger.info("  💾 Auto-saved checkpoint → %s", path)
-                return
+                logger.info("  💾 Auto-saved checkpoint → %s (epoch %d, batch %d)", path, epoch, batch_idx + 1 if batch_idx >= 0 else 0)
+                return path
 
             path = self.checkpoint_dir / f"checkpoint_epoch_{epoch:03d}.pt"
             temp_path = path.with_suffix(".tmp")
@@ -409,8 +602,10 @@ class Trainer:
                     "  ★ New best model saved (val_loss=%.6f) → %s",
                     val_loss, best_path,
                 )
+            return path
         except Exception as e:
             logger.error("  ⚠ Checkpoint save failed (%s); continuing training without crashing...", e)
+            return None
 
     def _log_epoch(
         self,
@@ -449,16 +644,117 @@ class Trainer:
         with open(self._weights_log_file, "a") as f:
             f.write(json.dumps(record) + "\n")
 
-    def load_checkpoint(self, path: str | Path) -> int:
-        """Load a checkpoint and return the epoch number."""
-        ckpt = torch.load(path, map_location=self.device)
+    def load_checkpoint(self, path: str | Path) -> dict[str, Any]:
+        """Load a checkpoint and return a metadata dictionary with resume info.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the checkpoint file (.pt).
+
+        Returns
+        -------
+        dict[str, Any]
+            Dictionary containing:
+            - "epoch": int (checkpointed epoch)
+            - "batch_idx": int (-1 if saved at end of epoch, or >=0 if mid-epoch)
+            - "next_epoch": int (epoch to start/resume training)
+            - "start_batch": int (batch index to start/resume training)
+            - "global_step": int
+            - "val_loss": float
+            - "best_val_loss": float
+            - "epoch_accum": dict
+            - "weight_accum": dict
+            - "n_batches": int
+            - "history": dict
+        """
+        try:
+            ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        except TypeError:
+            ckpt = torch.load(path, map_location=self.device)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
+
+        if "scheduler_state_dict" in ckpt and ckpt["scheduler_state_dict"]:
             self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if "loss_balancer_state_dict" in ckpt and self.loss_balancer and ckpt["loss_balancer_state_dict"]:
+
+        if (
+            "loss_balancer_state_dict" in ckpt
+            and self.loss_balancer
+            and ckpt["loss_balancer_state_dict"]
+        ):
             self.loss_balancer.load_state_dict(ckpt["loss_balancer_state_dict"])
-        self._best_val_loss = ckpt.get("val_loss", float("inf"))
-        epoch = ckpt.get("epoch", 0)
-        logger.info("Loaded checkpoint from epoch %d (val_loss=%.6f)", epoch, self._best_val_loss)
-        return epoch
+
+        self._best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
+        self._global_step = ckpt.get("global_step", 0)
+
+        if "history" in ckpt and ckpt["history"]:
+            self._current_history = {
+                k: list(v) for k, v in ckpt["history"].items()
+            }
+
+        # Restore RNG state
+        rng = ckpt.get("rng_state")
+        if rng:
+            if "torch" in rng and rng["torch"] is not None:
+                t_state = rng["torch"]
+                torch.set_rng_state(t_state.cpu() if isinstance(t_state, torch.Tensor) else t_state)
+            if "cuda" in rng and rng["cuda"] is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.set_rng_state_all(rng["cuda"])
+                except Exception as e:
+                    logger.debug("Could not restore CUDA RNG state: %s", e)
+            if "numpy" in rng and rng["numpy"] is not None:
+                np.random.set_state(rng["numpy"])
+            if "python" in rng and rng["python"] is not None:
+                random.setstate(rng["python"])
+
+        epoch = ckpt.get("epoch", 1)
+        batch_idx = ckpt.get("batch_idx", -1)
+        epoch_accum = ckpt.get("epoch_accum", {})
+        weight_accum = ckpt.get("weight_accum", {})
+        n_batches = ckpt.get("n_batches", 0)
+
+        sampler = getattr(self.train_loader, "batch_sampler", None)
+        if sampler is not None and hasattr(sampler, "total_batches"):
+            total_batches = sampler.total_batches()
+        else:
+            total_batches = len(self.train_loader) if self.train_loader is not None else 0
+
+        if batch_idx < 0 or (total_batches > 0 and batch_idx >= total_batches - 1):
+            next_epoch = epoch + 1
+            start_batch = 0
+            epoch_accum = {}
+            weight_accum = {}
+            n_batches = 0
+        else:
+            next_epoch = epoch
+            start_batch = batch_idx + 1
+
+        logger.info(
+            "Loaded checkpoint from %s: epoch %d (batch %d/%d, global_step=%d, best_val_loss=%.6f) → will resume at epoch %d, batch %d",
+            path, epoch, batch_idx + 1 if batch_idx >= 0 else total_batches,
+            total_batches, self._global_step, self._best_val_loss, next_epoch, start_batch,
+        )
+
+        return {
+            "epoch": epoch,
+            "batch_idx": batch_idx,
+            "next_epoch": next_epoch,
+            "start_batch": start_batch,
+            "global_step": self._global_step,
+            "val_loss": ckpt.get("val_loss", float("inf")),
+            "best_val_loss": self._best_val_loss,
+            "epoch_accum": epoch_accum,
+            "weight_accum": weight_accum,
+            "n_batches": n_batches,
+            "history": self._current_history,
+        }
+
+    def resume_latest(self) -> dict[str, Any] | None:
+        """Auto-detect and load checkpoint_latest.pt from checkpoint_dir if it exists."""
+        latest_path = self.checkpoint_dir / "checkpoint_latest.pt"
+        if latest_path.exists():
+            logger.info("Found existing checkpoint: %s. Loading state for auto-resumption...", latest_path)
+            return self.load_checkpoint(latest_path)
+        return None

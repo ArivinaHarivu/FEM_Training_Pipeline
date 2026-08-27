@@ -56,8 +56,11 @@ def main() -> None:
                         help="'cuda' or 'cpu' (auto-detected if omitted)")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--log_dir", type=str, default="logs")
+    parser.add_argument("--checkpoint_interval_batches", type=int, default=50,
+                        help="Save a batch-level checkpoint every N batches (default 50)")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint .pt to resume from")
+                        help="Path to checkpoint .pt to resume from, or 'auto' to "
+                             "automatically find and resume from checkpoint_latest.pt")
     parser.add_argument("--eval_only", action="store_true",
                         help="Skip training, run evaluation only")
     parser.add_argument("--no_adaptive_loss", action="store_true",
@@ -192,15 +195,22 @@ def main() -> None:
         log_dir=args.log_dir,
         adaptive_loss_weighting=not args.no_adaptive_loss,
         loss_balance_momentum=args.loss_balance_momentum,
+        checkpoint_interval_batches=args.checkpoint_interval_batches,
     )
 
+    resume_state = None
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        if args.resume.lower() == "auto":
+            resume_state = trainer.resume_latest()
+            if resume_state is None:
+                logger.info("No checkpoint_latest.pt found in %s; starting fresh.", args.checkpoint_dir)
+        else:
+            resume_state = trainer.load_checkpoint(args.resume)
 
     # ----- Train -----
     if not args.eval_only:
         logger.info("Starting training for %d epochs...", args.epochs)
-        history = trainer.train(num_epochs=args.epochs)
+        history = trainer.train(num_epochs=args.epochs, resume_state=resume_state)
         logger.info("Training complete. Best val loss: %.6f", trainer._best_val_loss)
 
     # ----- Evaluate -----

@@ -37,12 +37,14 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterator, Optional
+import random
 
 import h5py
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import Sampler
 from collections import deque
 
 logger = logging.getLogger(__name__)
@@ -81,6 +83,117 @@ class MeshData(Data):
         if key == "elem_conn":
             return 0
         return super().__cat_dim__(key, value, *args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# ResumableBatchSampler — deterministic shuffling with intra-epoch resumption
+# ---------------------------------------------------------------------------
+class ResumableBatchSampler(Sampler[list[int]]):
+    """Batch sampler supporting deterministic epoch shuffling and intra-epoch resumption.
+
+    When resuming training mid-epoch at batch index `start_batch`, this sampler
+    slices the batch indices directly so that the underlying DataLoader does not
+    need to read or process completed samples from disk.
+
+    Parameters
+    ----------
+    dataset_len : int
+        Total number of samples in the dataset.
+    batch_size : int
+        Number of samples per batch.
+    shuffle : bool
+        Whether to shuffle sample indices every epoch. Default True.
+    seed : int
+        Base seed for deterministic per-epoch permutations. Default 42.
+    drop_last : bool
+        Whether to drop the final incomplete batch. Default False.
+    """
+
+    def __init__(
+        self,
+        dataset_len: int,
+        batch_size: int,
+        shuffle: bool = True,
+        seed: int = 42,
+        drop_last: bool = False,
+    ) -> None:
+        self.dataset_len = dataset_len
+        self.batch_size = max(1, batch_size)
+        self.shuffle = shuffle
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 1
+        self.start_batch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the current epoch for deterministic permutation generation."""
+        self.epoch = epoch
+
+    def set_start_batch(self, start_batch: int) -> None:
+        """Set the batch offset for resuming mid-epoch."""
+        self.start_batch = max(0, start_batch)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        if self.dataset_len == 0:
+            return
+
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(self.dataset_len, generator=g).tolist()
+        else:
+            indices = list(range(self.dataset_len))
+
+        # Build complete batch list
+        batches: list[list[int]] = []
+        for i in range(0, len(indices), self.batch_size):
+            batch = indices[i : i + self.batch_size]
+            if len(batch) == self.batch_size or not self.drop_last:
+                batches.append(batch)
+
+        # Slice remaining batches if resuming mid-epoch
+        if self.start_batch > 0:
+            batches = batches[self.start_batch :]
+
+        for b in batches:
+            yield b
+
+    def __len__(self) -> int:
+        """Return the number of batches remaining in the current epoch."""
+        total = self.total_batches()
+        if self.start_batch > 0:
+            return max(0, total - self.start_batch)
+        return total
+
+    def total_batches(self) -> int:
+        """Return the total number of batches in a full, un-sliced epoch."""
+        if self.dataset_len == 0:
+            return 0
+        if self.drop_last:
+            return self.dataset_len // self.batch_size
+        return (self.dataset_len + self.batch_size - 1) // self.batch_size
+
+    def state_dict(self) -> dict[str, Any]:
+        """Serialize sampler state for checkpointing."""
+        return {
+            "epoch": self.epoch,
+            "start_batch": self.start_batch,
+            "seed": self.seed,
+            "shuffle": self.shuffle,
+            "batch_size": self.batch_size,
+            "drop_last": self.drop_last,
+            "dataset_len": self.dataset_len,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore sampler state from checkpoint."""
+        self.epoch = state.get("epoch", self.epoch)
+        self.start_batch = state.get("start_batch", self.start_batch)
+        self.seed = state.get("seed", self.seed)
+        self.shuffle = state.get("shuffle", self.shuffle)
+        self.batch_size = state.get("batch_size", self.batch_size)
+        self.drop_last = state.get("drop_last", self.drop_last)
+
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +511,37 @@ def h5_to_meshdata(
     return data
 
 
+def sample_generator(seed: int, epoch: int, sample_id: int | str) -> np.random.Generator:
+    """Generate a deterministic NumPy RNG generator for a specific sample and epoch.
+
+    Uses NumPy's SeedSequence to prevent statistical correlation across adjacent
+    (seed, epoch, sample_id) tuples, guaranteeing worker-independent and
+    prefetch-tolerant data augmentation across multi-process DataLoaders.
+
+    Parameters
+    ----------
+    seed : int
+        Global base seed.
+    epoch : int
+        Current training epoch.
+    sample_id : int or str
+        Unique sample index or string identifier.
+
+    Returns
+    -------
+    np.random.Generator
+        Isolated deterministic RNG instance for this sample and epoch.
+    """
+    if isinstance(sample_id, str):
+        import zlib
+        sample_id_int = zlib.crc32(sample_id.encode("utf-8"))
+    else:
+        sample_id_int = int(sample_id)
+
+    ss = np.random.SeedSequence([seed, epoch, sample_id_int])
+    return np.random.default_rng(ss)
+
+
 # ---------------------------------------------------------------------------
 # Dataset class
 # ---------------------------------------------------------------------------
@@ -417,6 +561,12 @@ class FEMGraphDataset:
         manifest. Ignored if ``manifest_path`` is None.
     file_list : list[str], optional
         Explicit list of file paths. Overrides ``h5_dir`` discovery.
+    E : float, optional
+        Young's modulus override.
+    nu : float, optional
+        Poisson's ratio override.
+    seed : int
+        Base seed for deterministic per-sample generator. Default 42.
     """
 
     def __init__(
@@ -427,6 +577,7 @@ class FEMGraphDataset:
         file_list: list[str] | None = None,
         E: float | None = None,
         nu: float | None = None,
+        seed: int = 42,
     ):
         if file_list is not None:
             self._files = [Path(f) for f in file_list]
@@ -441,8 +592,14 @@ class FEMGraphDataset:
 
         self._E = E
         self._nu = nu
+        self.seed = seed
+        self.current_epoch: int = 1
 
         logger.info("FEMGraphDataset: %d files for split=%s", len(self._files), split)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set current epoch for deterministic per-sample RNG seeding."""
+        self.current_epoch = max(1, epoch)
 
     @staticmethod
     def _files_from_manifest(
@@ -514,6 +671,8 @@ def create_dataloaders(
     num_workers: int = 0,
     E: float | None = None,
     nu: float | None = None,
+    seed: int = 42,
+    use_resumable_sampler: bool = True,
 ) -> dict[str, PyGDataLoader]:
     """Create train/val/test DataLoaders from manifest + H5 directory.
 
@@ -527,6 +686,15 @@ def create_dataloaders(
         Batch size for DataLoaders.
     num_workers : int
         Number of data-loading workers.
+    E : float, optional
+        Young's modulus override.
+    nu : float, optional
+        Poisson's ratio override.
+    seed : int
+        Seed for deterministic training batch sampling. Default 42.
+    use_resumable_sampler : bool
+        Whether to use ResumableBatchSampler for the training split to
+        support zero-I/O intra-epoch batch resumption. Default True.
 
     Returns
     -------
@@ -541,18 +709,33 @@ def create_dataloaders(
             split=split,
             E=E,
             nu=nu,
+            seed=seed,
         )
         if len(ds) == 0:
             logger.warning("No files for split '%s'", split)
             continue
 
-        loaders[split] = PyGDataLoader(
-            ds,
-            batch_size=batch_size,
-            shuffle=(split == "train"),
-            num_workers=num_workers,
-            drop_last=False,
-        )
+        if split == "train" and use_resumable_sampler:
+            sampler = ResumableBatchSampler(
+                dataset_len=len(ds),
+                batch_size=batch_size,
+                shuffle=True,
+                seed=seed,
+                drop_last=False,
+            )
+            loaders["train"] = PyGDataLoader(
+                ds,
+                batch_sampler=sampler,
+                num_workers=num_workers,
+            )
+        else:
+            loaders[split] = PyGDataLoader(
+                ds,
+                batch_size=batch_size,
+                shuffle=(split == "train"),
+                num_workers=num_workers,
+                drop_last=False,
+            )
 
     return loaders
 
