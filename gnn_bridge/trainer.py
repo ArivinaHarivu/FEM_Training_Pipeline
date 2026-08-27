@@ -471,6 +471,15 @@ class Trainer:
                     curr_batch_idx + 1, total_batches,
                 )
                 self.optimizer.zero_grad()
+                
+                # Explicitly delete local variables to break references 
+                # so empty_cache() can actually free the fragmented memory
+                if 'preds' in locals(): del preds
+                if 'targets' in locals(): del targets
+                if 'losses' in locals(): del losses
+                if 'backward_loss' in locals(): del backward_loss
+                if 'batch' in locals(): del batch
+                
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
                 continue
