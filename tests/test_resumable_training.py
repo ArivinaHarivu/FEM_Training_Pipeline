@@ -449,6 +449,91 @@ def test_dataset_set_epoch_synchronization():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def test_batch_csv_logging_and_resilience():
+    """Verify batch_training_log.csv records all metrics, graph size, OOMs, and NaNs."""
+    temp_dir = Path(tempfile.mkdtemp())
+    try:
+        import csv
+        ckpt_dir = temp_dir / "checkpoints"
+        log_dir = temp_dir / "logs"
+
+        dataset = DummyDataset(size=8)
+        loader = PyGDataLoader(dataset, batch_size=2, shuffle=False)
+
+        model = DummyModel()
+        loss_fn = DummyLoss()
+
+        trainer = Trainer(
+            model=model,
+            loss_fn=loss_fn,
+            train_loader=loader,
+            device="cpu",
+            checkpoint_dir=ckpt_dir,
+            log_dir=log_dir,
+            adaptive_loss_weighting=True,
+        )
+
+        # 1. Normal run
+        trainer.train(num_epochs=1)
+
+        batch_log_path = log_dir / "batch_training_log.csv"
+        assert batch_log_path.exists(), "batch_training_log.csv was not created!"
+
+        with open(batch_log_path, "r", newline="") as f:
+            reader = list(csv.reader(f))
+
+        header = reader[0]
+        expected_header = [
+            "global_step", "epoch", "batch", "total_batches",
+            "num_nodes", "num_edges", "status",
+            "backward_loss", "total_loss", "L_u", "L_sigma",
+            "L_eps", "L_eps_corr", "L_vm",
+            "lr", "batch_time_s",
+        ]
+        assert header == expected_header, f"Header mismatch: {header} vs {expected_header}"
+
+        # 8 samples / batch_size 2 = 4 batches
+        data_rows = reader[1:]
+        assert len(data_rows) == 4, f"Expected 4 batch rows, got {len(data_rows)}"
+
+        for i, row in enumerate(data_rows):
+            assert row[1] == "1"  # epoch 1
+            assert row[2] == str(i + 1)  # batch index
+            assert int(row[4]) > 0  # num_nodes
+            assert int(row[5]) > 0  # num_edges
+            assert row[6] == "ok"  # status
+            assert float(row[7]) > 0.0  # backward_loss
+            assert float(row[9]) > 0.0  # L_u
+            assert float(row[10]) > 0.0  # L_sigma
+            assert float(row[13]) > 0.0  # L_vm
+
+        # 2. Test NaN loss logging
+        class NaNLoss(nn.Module):
+            def forward(self, preds, targets):
+                return {"total": torch.tensor(float("nan"))}
+
+        nan_trainer = Trainer(
+            model=model,
+            loss_fn=NaNLoss(),
+            train_loader=loader,
+            device="cpu",
+            checkpoint_dir=ckpt_dir / "nan",
+            log_dir=log_dir / "nan",
+        )
+        nan_trainer._train_epoch(epoch=1)
+
+        nan_log_path = log_dir / "nan" / "batch_training_log.csv"
+        with open(nan_log_path, "r", newline="") as f:
+            nan_rows = list(csv.reader(f))[1:]
+        assert len(nan_rows) == 4
+        for row in nan_rows:
+            assert row[6] == "nan_loss"
+            assert row[7] == ""  # backward_loss empty for skipped step
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     print("Running test_resumable_sampler_determinism...")
     test_resumable_sampler_determinism()
@@ -485,6 +570,10 @@ if __name__ == "__main__":
     print("Running test_continuous_vs_interrupted_training_trajectory...")
     test_continuous_vs_interrupted_training_trajectory()
     print("[PASS] test_continuous_vs_interrupted_training_trajectory passed")
+
+    print("Running test_batch_csv_logging_and_resilience...")
+    test_batch_csv_logging_and_resilience()
+    print("[PASS] test_batch_csv_logging_and_resilience passed")
 
     print("\nALL TESTS PASSED!")
 

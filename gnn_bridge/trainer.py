@@ -198,6 +198,7 @@ class Trainer:
         self._global_step: int = 0
         self._best_val_loss = float("inf")
         self._log_file = self.log_dir / "training_log.csv"
+        self._batch_log_file = self.log_dir / "batch_training_log.csv"
         self._weights_log_file = self.log_dir / "adaptive_weights_log.jsonl"
         self._last_train_weights: dict[str, float] = {}
         self._current_history: dict[str, list[float]] = {
@@ -208,18 +209,28 @@ class Trainer:
         self._init_log()
 
     def _init_log(self, force: bool = False) -> None:
-        """Initialize the CSV log file with headers if it does not exist."""
-        if not force and self._log_file.exists() and self._log_file.stat().st_size > 0:
-            return
-        with open(self._log_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "epoch", "train_loss", "train_L_u", "train_L_sigma",
-                "train_L_eps", "train_L_eps_corr", "train_L_vm",
-                "val_loss", "val_L_u", "val_L_sigma",
-                "val_L_eps", "val_L_eps_corr", "val_L_vm",
-                "lr", "epoch_time_s",
-            ])
+        """Initialize the CSV log files with headers if they do not exist."""
+        if force or not self._log_file.exists() or self._log_file.stat().st_size == 0:
+            with open(self._log_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "epoch", "train_loss", "train_L_u", "train_L_sigma",
+                    "train_L_eps", "train_L_eps_corr", "train_L_vm",
+                    "val_loss", "val_L_u", "val_L_sigma",
+                    "val_L_eps", "val_L_eps_corr", "val_L_vm",
+                    "lr", "epoch_time_s",
+                ])
+
+        if force or not self._batch_log_file.exists() or self._batch_log_file.stat().st_size == 0:
+            with open(self._batch_log_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "global_step", "epoch", "batch", "total_batches",
+                    "num_nodes", "num_edges", "status",
+                    "backward_loss", "total_loss", "L_u", "L_sigma",
+                    "L_eps", "L_eps_corr", "L_vm",
+                    "lr", "batch_time_s",
+                ])
 
     def train(
         self,
@@ -402,6 +413,19 @@ class Trainer:
             else:
                 curr_batch_idx = start_batch + i
 
+            batch_start_time = time.perf_counter()
+            num_nodes = getattr(batch, "num_nodes", None)
+            if num_nodes is None and hasattr(batch, "x") and batch.x is not None:
+                num_nodes = batch.x.shape[0]
+            num_nodes = int(num_nodes) if num_nodes is not None else 0
+
+            num_edges = getattr(batch, "num_edges", None)
+            if num_edges is None and hasattr(batch, "edge_index") and batch.edge_index is not None:
+                num_edges = batch.edge_index.shape[1]
+            num_edges = int(num_edges) if num_edges is not None else 0
+
+            current_lr = self.optimizer.param_groups[0]["lr"]
+
             try:
                 batch = batch.to(self.device)
                 self.optimizer.zero_grad()
@@ -423,9 +447,22 @@ class Trainer:
                     backward_loss = losses["total"]
 
                 if not torch.isfinite(backward_loss):
+                    batch_time = time.perf_counter() - batch_start_time
                     logger.warning(
                         "  ⚠ Batch %d/%d produced non-finite loss (NaN/Inf); skipping step to protect weights...",
                         curr_batch_idx + 1, total_batches,
+                    )
+                    self._log_batch(
+                        epoch=epoch,
+                        batch_idx=curr_batch_idx,
+                        total_batches=total_batches,
+                        num_nodes=num_nodes,
+                        num_edges=num_edges,
+                        status="nan_loss",
+                        backward_loss=None,
+                        losses=losses,
+                        lr=current_lr,
+                        batch_time=batch_time,
                     )
                     self.optimizer.zero_grad()
                     continue
@@ -445,6 +482,22 @@ class Trainer:
                 for k, v in losses.items():
                     accum[k] = accum.get(k, 0.0) + v.item()
                 n_batches += 1
+
+                batch_time = time.perf_counter() - batch_start_time
+
+                # Log batch to batch_training_log.csv
+                self._log_batch(
+                    epoch=epoch,
+                    batch_idx=curr_batch_idx,
+                    total_batches=total_batches,
+                    num_nodes=num_nodes,
+                    num_edges=num_edges,
+                    status="ok",
+                    backward_loss=backward_loss.item(),
+                    losses=losses,
+                    lr=current_lr,
+                    batch_time=batch_time,
+                )
 
                 if (curr_batch_idx + 1) == 1 or (curr_batch_idx + 1) % 10 == 0 or (curr_batch_idx + 1) == total_batches:
                     logger.info(
@@ -466,12 +519,27 @@ class Trainer:
                     )
 
             except torch.cuda.OutOfMemoryError:
+                batch_time = time.perf_counter() - batch_start_time
                 logger.warning(
                     "  ⚠ Batch %d/%d exceeded memory limits; skipping sample and freeing cache...",
                     curr_batch_idx + 1, total_batches,
                 )
                 self.optimizer.zero_grad()
-                
+
+                # Log OOM batch to CSV
+                self._log_batch(
+                    epoch=epoch,
+                    batch_idx=curr_batch_idx,
+                    total_batches=total_batches,
+                    num_nodes=num_nodes,
+                    num_edges=num_edges,
+                    status="oom",
+                    backward_loss=None,
+                    losses=None,
+                    lr=current_lr,
+                    batch_time=batch_time,
+                )
+
                 # Explicitly delete local variables to break references 
                 # so empty_cache() can actually free the fragmented memory
                 if 'preds' in locals(): del preds
@@ -479,7 +547,7 @@ class Trainer:
                 if 'losses' in locals(): del losses
                 if 'backward_loss' in locals(): del backward_loss
                 if 'batch' in locals(): del batch
-                
+
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
                 continue
@@ -615,6 +683,61 @@ class Trainer:
         except Exception as e:
             logger.error("  ⚠ Checkpoint save failed (%s); continuing training without crashing...", e)
             return None
+
+    def _log_batch(
+        self,
+        epoch: int,
+        batch_idx: int,
+        total_batches: int,
+        num_nodes: int,
+        num_edges: int,
+        status: str,
+        backward_loss: Optional[float] = None,
+        losses: Optional[dict[str, Any]] = None,
+        lr: float = 0.0,
+        batch_time: float = 0.0,
+    ) -> None:
+        """Append one batch record to batch_training_log.csv with immediate flush."""
+        losses = losses or {}
+
+        def _fmt(val: Any) -> str:
+            if val is None:
+                return ""
+            if isinstance(val, torch.Tensor):
+                val = val.item()
+            try:
+                f_val = float(val)
+                if np.isnan(f_val):
+                    return "nan"
+                return f"{f_val:.6e}"
+            except (ValueError, TypeError):
+                return str(val)
+
+        row = [
+            self._global_step,
+            epoch,
+            batch_idx + 1,
+            total_batches,
+            num_nodes,
+            num_edges,
+            status,
+            f"{backward_loss:.6e}" if backward_loss is not None else "",
+            _fmt(losses.get("total")),
+            _fmt(losses.get("L_u")),
+            _fmt(losses.get("L_sigma")),
+            _fmt(losses.get("L_eps")),
+            _fmt(losses.get("L_eps_corr")),
+            _fmt(losses.get("L_vm")),
+            f"{lr:.2e}",
+            f"{batch_time:.4f}",
+        ]
+        try:
+            with open(self._batch_log_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(row)
+                f.flush()
+        except Exception as e:
+            logger.debug("Failed writing batch log (%s); continuing...", e)
 
     def _log_epoch(
         self,
