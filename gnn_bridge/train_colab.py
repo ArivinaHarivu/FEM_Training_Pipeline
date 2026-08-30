@@ -224,7 +224,7 @@ trainer = Trainer(
     device=str(device),
     checkpoint_dir=CHECKPOINT_DIR,
     log_dir=LOG_DIR,
-    adaptive_loss_weighting=True,
+    adaptive_loss_weighting=False,
     checkpoint_interval_batches=25,
 )
 
@@ -237,7 +237,7 @@ else:
 
 print(f"\n{'=' * 65}")
 print(f"  STARTING TRAINING: {NUM_EPOCHS} epochs, lr={LR}, batch_size={BATCH_SIZE}")
-print(f"  Device: {device} | Adaptive Loss Balancer: Active")
+print(f"  Device: {device} | Adaptive Loss Balancer: Disabled (Static Weighted Sum)")
 print(f"{'=' * 65}\n")
 
 history = trainer.train(num_epochs=NUM_EPOCHS, resume_state=resume_state)

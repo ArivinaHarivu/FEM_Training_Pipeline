@@ -145,11 +145,15 @@ class Trainer:
     log_dir : str or Path
         Directory for CSV training logs.
     adaptive_loss_weighting : bool
-        Whether to use AdaptiveLossBalancer. Default True.
+        Whether to use AdaptiveLossBalancer. Default False.
     loss_balance_momentum : float
         EMA momentum for AdaptiveLossBalancer. Default 0.9.
     checkpoint_interval_batches : int
         Save a batch-level checkpoint every N batches. Default 50.
+    warmup_steps : int
+        Number of initial optimizer steps for linear LR warmup. Default 400.
+    warmup_start_lr : float
+        Initial learning rate at step 0 of warmup. Default 1e-6.
     """
 
     def __init__(
@@ -163,9 +167,11 @@ class Trainer:
         device: str | None = None,
         checkpoint_dir: str | Path = "checkpoints",
         log_dir: str | Path = "logs",
-        adaptive_loss_weighting: bool = True,
+        adaptive_loss_weighting: bool = False,
         loss_balance_momentum: float = 0.9,
         checkpoint_interval_batches: int = 50,
+        warmup_steps: int = 400,
+        warmup_start_lr: float = 1e-6,
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -176,7 +182,12 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
 
-        self.optimizer = optim.Adam(model.parameters(), lr=lr)
+        self.base_lr = lr
+        self.warmup_steps = max(0, warmup_steps)
+        self.warmup_start_lr = warmup_start_lr
+
+        initial_lr = warmup_start_lr if self.warmup_steps > 0 else lr
+        self.optimizer = optim.Adam(model.parameters(), lr=initial_lr)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode="min", factor=0.5, patience=10,
         )
@@ -423,6 +434,16 @@ class Trainer:
             if num_edges is None and hasattr(batch, "edge_index") and batch.edge_index is not None:
                 num_edges = batch.edge_index.shape[1]
             num_edges = int(num_edges) if num_edges is not None else 0
+
+            # Step-counter-gated linear LR warmup
+            if self._global_step < self.warmup_steps:
+                alpha = self._global_step / max(1, self.warmup_steps)
+                warmup_lr = self.warmup_start_lr + alpha * (self.base_lr - self.warmup_start_lr)
+                for pg in self.optimizer.param_groups:
+                    pg["lr"] = warmup_lr
+            elif self._global_step == self.warmup_steps:
+                for pg in self.optimizer.param_groups:
+                    pg["lr"] = self.base_lr
 
             current_lr = self.optimizer.param_groups[0]["lr"]
 

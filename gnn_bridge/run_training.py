@@ -63,10 +63,10 @@ def main() -> None:
                              "automatically find and resume from checkpoint_latest.pt")
     parser.add_argument("--eval_only", action="store_true",
                         help="Skip training, run evaluation only")
-    parser.add_argument("--no_adaptive_loss", action="store_true",
-                        help="Disable live adaptive loss-term rebalancing "
-                             "(on by default) and use loss_fn's static "
-                             "w_u/w_sigma/... weights as-is")
+    parser.add_argument("--adaptive_loss", action="store_true",
+                        help="Enable live adaptive loss-term rebalancing "
+                             "(off by default, uses loss_fn's static "
+                             "w_u/w_sigma/... weights as-is)")
     parser.add_argument("--loss_balance_momentum", type=float, default=0.9,
                         help="EMA momentum for adaptive loss-term "
                              "rebalancing (higher = smoother/slower to react)")
@@ -78,6 +78,33 @@ def main() -> None:
         with open(args.config) as f:
             config.update(yaml.safe_load(f))
 
+    # Merge config file values into args if not explicitly passed on CLI
+    training_cfg = config.get("training", {})
+    if args.batch_size is None:
+        args.batch_size = training_cfg.get("batch_size", 4)
+    if args.epochs is None:
+        args.epochs = training_cfg.get("epochs", 100)
+    if args.hidden_dim is None:
+        args.hidden_dim = config.get("model", {}).get("hidden_dim", 128)
+    if args.num_layers is None:
+        args.num_layers = config.get("model", {}).get("num_processor_layers", 15)
+
+    # ----- Device -----
+    if args.device is None:
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(args.device)
+    logger.info("Using device: %s", device)
+
+    # ----- Data -----
+    mat_cfg = config.get("material", {})
+    E = mat_cfg.get("E", 210.0e9)
+    nu = mat_cfg.get("nu", 0.3)
+    yield_strength = mat_cfg.get("yield_strength", 420.0e6)
+
+    data_cfg = config.get("data", {})
+    manifest_path = args.manifest or data_cfg.get("manifest_path", "output/manifest.csv")
+    h5_dir = args.h5_dir or data_cfg.get("h5_dir", "output/raw")
+
     # ----- Import heavy modules after arg parsing -----
     from gnn_bridge.dataloader import (
         FEMGraphDataset,
@@ -87,35 +114,28 @@ def main() -> None:
     from gnn_bridge.trainer import Trainer
     from gnn_bridge.metrics import evaluate_model, print_evaluation_report
 
-    # ----- Material constants -----
-    material_cfg = config.get("material", {})
-    mat_E = material_cfg.get("E", 210e9)
-    mat_nu = material_cfg.get("nu", 0.3)
-
-    # ----- DataLoaders -----
-    logger.info("Creating DataLoaders from %s", args.h5_dir)
     loaders = create_dataloaders(
-        h5_dir=args.h5_dir,
-        manifest_path=args.manifest,
+        h5_dir=h5_dir,
+        manifest_path=manifest_path,
         batch_size=args.batch_size,
-        E=mat_E,
-        nu=mat_nu,
+        E=E,
+        nu=nu,
+        num_workers=data_cfg.get("num_workers", 0),
+        seed=data_cfg.get("seed", 42),
     )
 
-    if "train" not in loaders:
-        logger.error("No training data found. Check manifest and h5_dir.")
-        sys.exit(1)
-
-    # ----- Field statistics for loss normalisation -----
-    logger.info("Computing field statistics from training data...")
+    # Field stats for loss normalisation
     train_dataset = FEMGraphDataset(
-        h5_dir=args.h5_dir,
-        manifest_path=args.manifest,
+        h5_dir=h5_dir,
+        manifest_path=manifest_path,
         split="train",
-        E=mat_E,
-        nu=mat_nu,
+        E=E,
+        nu=nu,
     )
-    field_stds = compute_field_stds(train_dataset)
+    field_stds = compute_field_stds(
+        train_dataset,
+        max_samples=data_cfg.get("field_stats_samples", 50),
+    )
 
     # ----- Model -----
     model_cfg = config.get("model", {})
@@ -193,7 +213,7 @@ def main() -> None:
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
         log_dir=args.log_dir,
-        adaptive_loss_weighting=not args.no_adaptive_loss,
+        adaptive_loss_weighting=args.adaptive_loss,
         loss_balance_momentum=args.loss_balance_momentum,
         checkpoint_interval_batches=args.checkpoint_interval_batches,
     )
