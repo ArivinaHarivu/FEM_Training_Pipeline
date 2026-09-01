@@ -25,3 +25,44 @@ ENV/
 
 #conda env
 **/miniconda.sh
+
+# AI agent config & assistant rules
+CLAUDE.md
+AGENTS.md
+.agents/
+
+# Checkpoints & model weights
+checkpoints/
+*.pt
+*.ckpt
+
+# Notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Debug / inspection scripts
+inspect_h5.py
+check_h5_indexing.py
+
+# IDE workspace files
+*.code-workspace
+
+# Training outputs & logs
+logs/
+*.csv
+
+# Binary docs
+*.pdf
+
+# Internal working specs
+opus_*.md
+*_CONSOLIDATED.md
+
+# Smoke test outputs
+smoke_test_run/
+
+# Nested repo copies
+GNN_project_version_2/
+
+# OS metadata
+Thumbs.db

@@ -40,6 +40,8 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 import random
 
+import shutil
+
 import h5py
 import numpy as np
 import pandas as pd
@@ -66,6 +68,15 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 _HOP_CAP = 20  # Clamp BFS hops before normalising to [0, 1]
+
+# Persistent local cache for HDF5 files read from Google Drive FUSE.
+# HDF5's random-seek access pattern causes FUSE Transport endpoint
+# disconnects ([Errno 107]).  Copying each file once to local VM
+# storage converts the access to a single sequential stream, then
+# all subsequent reads (epoch 2+) hit local SSD at ~GB/s with zero
+# Drive network traffic.
+_LOCAL_H5_CACHE = Path("/tmp/fem_h5_cache")
+_LOCAL_H5_CACHE.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +409,14 @@ def h5_to_meshdata(
     """
     torch_dtype = getattr(torch, dtype)
 
-    with h5py.File(str(file_path), "r") as f:
+    # --- Local cache: copy from Drive once, read locally forever ---
+    file_path = Path(file_path)
+    local_path = _LOCAL_H5_CACHE / file_path.name
+    if not local_path.exists():
+        logger.debug("Caching %s → %s", file_path.name, local_path)
+        shutil.copy2(str(file_path), str(local_path))
+
+    with h5py.File(str(local_path), "r") as f:
         vertices = np.array(f["Vertices"], dtype=np.float64)  # (N, 3)
         num_nodes = vertices.shape[0]
 

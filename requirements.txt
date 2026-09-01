@@ -1,0 +1,21 @@
+# Training Pipeline — Dependencies
+#
+# Install PyTorch first:  https://pytorch.org/get-started/locally/
+# Install PyG second:     https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+#
+# These two must be installed manually (platform-specific wheels)
+# before running `pip install -r requirements.txt`.
+
+torch>=2.0
+torch-geometric>=2.4
+numpy>=1.24
+pandas>=2.0
+h5py>=3.8
+pyyaml>=6.0
+scipy>=1.10
+
+# Dataset generation only (dataset_gen_3d/) — uncomment if generating new FEM data:
+# gmsh>=4.11
+# meshio>=5.3
+# networkx>=3.0
+# DOLFINx: installed separately, see dataset_gen_3d/README.md

@@ -44,27 +44,47 @@ synthetic validation dataset target to be representative of real
 components?"* Resolving the datasheet accuracy above does NOT resolve
 this representativeness question — they are independent validations.
 
-## Toolchain
+## Toolchain & Prerequisites
 
 - **Geometry + meshing:** Gmsh Python API, OCC kernel
-- **Solving:** FEniCS/Dolfin (legacy, via `fem-on-colab`)
-- **Mesh interchange:** meshio (Gmsh .msh → Dolfin XDMF)
-- **No ML dependencies:** torch / torch-geometric / main_package are NOT used
+- **Solving:** FEniCSx (`dolfinx`) or legacy FEniCS (`dolfin`) via `fem-on-colab`
+- **Mesh interchange:** meshio (Gmsh .msh → XDMF)
+- **No ML dependencies:** PyTorch and PyG are NOT required for dataset generation.
+
+### Installing FEniCSx / DOLFINx
+
+DOLFINx includes compiled C++/MPI bindings and cannot be installed via a simple `pip install`. Choose the installation method for your environment:
+
+#### 1. Google Colab (Recommended)
+```bash
+# Option A: FEniCSx (dolfinx)
+!wget -O - https://fem-on-colab.github.io/releases.sh | bash -s -- --install-fenicsx
+
+# Option B: Legacy FEniCS (dolfin)
+!wget "https://fem-on-colab.github.io/releases/fenics-install-real.sh" -O "/tmp/fenics-install.sh"
+!bash "/tmp/fenics-install.sh"
+```
+
+#### 2. Ubuntu / Debian Linux
+```bash
+sudo add-apt-repository ppa:fenics-packages/fenics
+sudo apt-get update
+sudo apt-get install -y python3-dolfinx
+```
+
+#### 3. Conda / Mamba Environment
+```bash
+conda create -n fenicsx-env -c conda-forge fenics-dolfinx mpich python=3.11
+conda activate fenicsx-env
+```
 
 ## Running on Colab
 
 ```python
-# Cell 1: Install FEniCS
-try:
-    import dolfin
-except ImportError:
-    !wget "https://fem-on-colab.github.io/releases/fenics-install-real.sh" -O "/tmp/fenics-install.sh"
-    !bash "/tmp/fenics-install.sh"
-    import dolfin
+# Cell 1: Install FEniCSx
+!wget -O - https://fem-on-colab.github.io/releases.sh | bash -s -- --install-fenicsx
 
-# Cell 2: Clone and install pipeline
-!git clone https://github.com/<your-repo>/Training_pipeline.git
-%cd Training_pipeline/dataset_gen_3d
+# Cell 2: Install Python dependencies
 !pip install -r requirements.txt
 
 # Cell 3: Run calibration
