@@ -45,13 +45,13 @@ def main() -> None:
                         help="Path to manifest.csv (must have 'split' column)")
     parser.add_argument("--config", type=str, default=None,
                         help="Path to GNN config.yaml (optional)")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--hidden_dim", type=int, default=None,
                         help="Model hidden dimension (e.g. 64 or 128)")
     parser.add_argument("--num_layers", type=int, default=None,
                         help="Number of processor MPNN layers (e.g. 8)")
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--device", type=str, default=None,
                         help="'cuda' or 'cpu' (auto-detected if omitted)")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
@@ -84,6 +84,8 @@ def main() -> None:
         args.batch_size = training_cfg.get("batch_size", 4)
     if args.epochs is None:
         args.epochs = training_cfg.get("epochs", 100)
+    if args.lr is None:
+        args.lr = training_cfg.get("lr", 1e-3)
     if args.hidden_dim is None:
         args.hidden_dim = config.get("model", {}).get("hidden_dim", 128)
     if args.num_layers is None:
@@ -99,7 +101,7 @@ def main() -> None:
     mat_cfg = config.get("material", {})
     E = mat_cfg.get("E", 210.0e9)
     nu = mat_cfg.get("nu", 0.3)
-    yield_strength = mat_cfg.get("yield_strength", 420.0e6)
+    yield_strength = mat_cfg.get("sigma_yield", mat_cfg.get("yield_strength", 420.0e6))
 
     data_cfg = config.get("data", {})
     manifest_path = args.manifest or data_cfg.get("manifest_path", "output/manifest.csv")
@@ -124,16 +126,11 @@ def main() -> None:
         seed=data_cfg.get("seed", 42),
     )
 
-    # Field stats for loss normalisation
-    train_dataset = FEMGraphDataset(
-        h5_dir=h5_dir,
-        manifest_path=manifest_path,
-        split="train",
-        E=E,
-        nu=nu,
-    )
+    # Field stats for loss normalisation — reuse the train loader's dataset
+    # instead of creating a second FEMGraphDataset (avoids re-reading
+    # every H5 file from disk / FUSE a second time).
     field_stds = compute_field_stds(
-        train_dataset,
+        loaders["train"].dataset,
         max_samples=data_cfg.get("field_stats_samples", 50),
     )
 
@@ -185,9 +182,9 @@ def main() -> None:
         hidden_dim=hidden_dim,
         num_processor_layers=num_layers,
         stress_net_local_mp_layers=model_cfg.get("stress_net_local_mp_layers", 3),
-        E=material_cfg.get("E", 210e9),
-        nu=material_cfg.get("nu", 0.3),
-        yield_strength=material_cfg.get("yield_strength", 420e6),
+        E=E,
+        nu=nu,
+        yield_strength=yield_strength,
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
